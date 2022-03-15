@@ -1,0 +1,6 @@
+# transformers @ git+http://github.com/ibeltagy/transformers.git@longformer_encoder_decoder#egg=transformers
+transformers
+# pytorch-lightning==1.0.8
+pip install git+https://github.com/PytorchLightning/pytorch-lightning.git@release/1.3.x --upgrade
+tensorboardX
+test-tube==0.7.5
