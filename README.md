@@ -4,6 +4,14 @@ In our paper [**Staged Training for Transformer Language Models**](https://arxiv
 
 We release the reproducible code for the growth operator and evaluation scripts here.
 
+## Setup
+
+The scripts in this repository require Python 3.7 or newer.
+Once you have a suitable Python environment, first install PyTorch v1.9.0 according the [official instructions](https://pytorch.org/get-started/previous-versions/#v190). Then run
+```
+pip install -r requirements.txt
+```
+
 ## Structure
 ```
 .
@@ -79,7 +87,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/gpt_pretrain.py \
 
 If you use staged training in your research or wish to refer to the baseline results published here, 
 please use the following BibTeX entry. 
-```shell
+```
 @misc{shen2022staged,
     title={Staged Training for Transformer Language Models},
     author={Sheng Shen and Pete Walsh and Kurt Keutzer and Jesse Dodge and Matthew Peters and Iz Beltagy},
