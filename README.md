@@ -1,10 +1,27 @@
 # staged-training
 
-In our paper "[Staged Training for Transformer Language Models](https://arxiv.org/abs/2203.06211)", we propose a staged training setup that begins with a small model and incrementally increases the amount of compute used for training by applying a "growth operator" to increase the model depth and width. By initializing each stage with the output of the previous one, the training process effectively re-uses the compute from prior stages and becomes more efficient. 
+In our paper [**Staged Training for Transformer Language Models**](https://arxiv.org/abs/2203.06211), we propose a staged training setup that begins with a small model and incrementally increases the amount of compute used for training by applying a "growth operator" to increase the model depth and width. By initializing each stage with the output of the previous one, the training process effectively re-uses the compute from prior stages and becomes more efficient. 
 
 We release the reproducible code for the growth operator and evaluation scripts here.
+
 ## Structure
 ```
+.
+├── scripts/
+│  ├── cheatsheet.txt              # list of commands for using the width/depth growth operators
+│  ├── gpt_pretrain.py             # pretraining script that implements the width/depth growth operators
+│  ├── remove_oracle.ipynb         # used to estimate the contants to determine the growth points
+│  └── simulate_scaling_law.ipynb  # 
+├── evaluation/
+│  ├── tools/
+│  ├── Dockerfile
+│  ├── eval_lambada.py
+│  ├── eval_wikitext.py
+│  ├── README.md
+│  └── requirements.txt
+├── dev-requirements.txt
+└── requirements.txt
+
 REPO ROOT
  |
  |-- scripts                  
@@ -19,7 +36,8 @@ REPO ROOT
 ```
 
 ## Growth Operator
-Our growth operators (width/depth) each takes as input the entire training state (including model parameters, optimizer state, learning rate schedule, etc.) and output a new training state from which training continues.
+
+Our growth operators (width/depth) each take as input the entire training state (including model parameters, optimizer state, learning rate schedule, etc.) and output a new training state from which training continues.
 
 Please see the `scripts/cheatsheet.txt` for full training details. 
 
