@@ -1,0 +1,51 @@
+# YAML 1.2
+---
+cff-version: "1.2.0"
+title: "Staged Training for Transformer Language Models"
+license: "Apache-2.0"
+message: "If you use staged training in your research or wish to refer to the baseline results published here, please cite using this metadata."
+repository-code: "https://github.com/allenai/staged-training"
+authors: 
+  - affiliation: "University of California, Berkeley"
+    family-names: Shen
+    given-names: Sheng
+  - affiliation: "Allen Institute for Artificial Intelligence"
+    family-names: Walsh
+    given-names: Pete
+  - affiliation: "University of California, Berkeley"
+    family-names: Keutzer
+    given-names: Kurt
+  - affiliation: "Allen Institute for Artificial Intelligence"
+    family-names: Dodge
+    given-names: Jesse
+  - affiliation: "Allen Institute for Artificial Intelligence"
+    family-names: Peters
+    given-names: Matthew
+  - affiliation: "Allen Institute for Artificial Intelligence"
+    family-names: Beltagy
+    given-names: Iz
+preferred-citation:
+  type: "article"
+  title: "Staged Training for Transformer Language Models"
+  doi: "10.48550/arXiv.2203.06211"
+  url: "https://arxiv.org/abs/2203.06211"
+  year: 2022
+  authors:
+    - affiliation: "University of California, Berkeley"
+      family-names: Shen
+      given-names: Sheng
+    - affiliation: "Allen Institute for Artificial Intelligence"
+      family-names: Walsh
+      given-names: Pete
+    - affiliation: "University of California, Berkeley"
+      family-names: Keutzer
+      given-names: Kurt
+    - affiliation: "Allen Institute for Artificial Intelligence"
+      family-names: Dodge
+      given-names: Jesse
+    - affiliation: "Allen Institute for Artificial Intelligence"
+      family-names: Peters
+      given-names: Matthew
+    - affiliation: "Allen Institute for Artificial Intelligence"
+      family-names: Beltagy
+      given-names: Iz
