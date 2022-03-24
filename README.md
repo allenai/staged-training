@@ -83,6 +83,21 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/gpt_pretrain.py \
   --doubling layers
 ``` 
 
+## Evaluation
+
+Use `evaluation/eval_wikitext.py` or `evaluation/eval_lambada.py` to evaluate [GPT-2](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) on one of the supported datasets. For example:
+
+```bash
+python evaluation/eval_wikitext.py
+```
+
+Or using Docker:
+
+```bash
+docker build -t evaluation:latest .
+docker run --rm --gpus all evaluation:latest evaluation/eval_wikitext.py
+```
+
 ## Reference
 
 If you use staged training in your research or wish to refer to the baseline results published here, 

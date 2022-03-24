@@ -4,30 +4,26 @@ Evaluate pretrained GPT-2 models on standard datasets.
 Adapted from https://github.com/huggingface/transformers/blob/master/examples/pytorch/language-modeling/run_clm_no_trainer.py.
 """  # noqa: E501
 
-from itertools import islice
 import math
-import random
 import os
+import random
 import shutil
 import tempfile
-from typing import Optional, Any, Dict
+from itertools import islice
+from typing import Any, Dict, Optional
 
-from accelerate import Accelerator
 import click
-from click_help_colors import HelpColorsCommand, HelpColorsGroup
-from more_itertools import chunked
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, Sampler, DistributedSampler
-from transformers import (
-    GPT2Tokenizer,
-    GPT2LMHeadModel,
-    GPT2Config,
-    default_data_collator,
-    DataCollatorForLanguageModeling,
-)
-from transformers.optimization import AdamW, get_linear_schedule_with_warmup
+from accelerate import Accelerator
+from click_help_colors import HelpColorsCommand, HelpColorsGroup
+from more_itertools import chunked
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
 from tqdm import tqdm
+from transformers import (DataCollatorForLanguageModeling, GPT2Config,
+                          GPT2LMHeadModel, GPT2Tokenizer,
+                          default_data_collator)
+from transformers.optimization import AdamW, get_linear_schedule_with_warmup
 
 from tools.mmap_dataset import get_mmap_dataset
 from tools.openwebtext_dataset import get_openwebtext_dataset
@@ -124,13 +120,12 @@ def eval(
 
         # Load state dict.
         state_dict = torch.load(checkpoint_file)
-        state_dict = state_dict['state_dict']
+        state_dict = state_dict["state_dict"]
         state_dict = {k.replace("model.", ""): p for k, p in state_dict.items()}
 
         config = GPT2Config.from_pretrained(model_name)
 
         # Guess model size.
-        print(state_dict.keys)
         config.n_embd = state_dict["transformer.wte.weight"].shape[1]
         config.n_layer = len(
             [key for key in state_dict if key.endswith("mlp.c_proj.bias")]
@@ -142,7 +137,7 @@ def eval(
             config.n_head = 16
         else:
             config.n_head = 8
-        
+
         config.n_positions = 1024
         if "alibi" in checkpoint_file:
             config.alibi_embeddings = True
