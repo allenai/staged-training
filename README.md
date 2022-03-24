@@ -12,23 +12,6 @@ Once you have a suitable Python environment, first install PyTorch v1.9.0 accord
 pip install -r requirements.txt
 ```
 
-## Structure
-```
-.
-├── requirements.txt        # Python requirements needed to run our scripts
-├── dev-requirements.txt    # Python requirements needed for development only
-├── scripts/
-│  ├── cheatsheet.txt       # list of commands for using the width/depth growth operators
-│  ├── gpt_pretrain.py      # pretraining script that implements the width/depth growth operators
-│  └── remove_oracle.ipynb  # used to estimate the contants to determine the growth points
-└── evaluation/
-   ├── tools/               # common code
-   ├── Dockerfile           # for building a Docker image to run evaluation scripts
-   ├── eval_lambada.py      # evaluate a checkpoint on LAMBADA
-   ├── eval_wikitext.py     # evaluate a checkpoint on WikiText
-   └── requirements.txt     # additional requirements for evaluation scripts
-```
-
 ## Growth Operator
 
 Our growth operators (width/depth) each take as input the entire training state (including model parameters, optimizer state, learning rate schedule, etc.) and output a new training state from which training continues.
@@ -82,6 +65,21 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/gpt_pretrain.py \
   --resume final_runs/final_gpt2_large_div2_depth_check_bs512_lr0.0020_warmup3k_seqlen1024_debug/checkpoint-epoch=0-step=6499.ckpt \
   --doubling layers
 ``` 
+
+## Evaluation
+
+Use `evaluation/eval_wikitext.py` or `evaluation/eval_lambada.py` to evaluate [GPT-2](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) on one of the supported datasets. For example:
+
+```bash
+python evaluation/eval_wikitext.py
+```
+
+Or using Docker:
+
+```bash
+docker build -t evaluation:latest .
+docker run --rm --gpus all evaluation:latest evaluation/eval_wikitext.py
+```
 
 ## Reference
 

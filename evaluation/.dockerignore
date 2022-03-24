@@ -1,7 +1,0 @@
-.dockerignore
-**.pyc
-**/__pycache__
-.gitignore
-.git
-**/.mypy_cache
-beaker
