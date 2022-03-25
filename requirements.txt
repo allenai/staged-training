@@ -12,3 +12,4 @@ more-itertools==8.8.0
 tensorboardX
 tqdm==4.61.2
 test-tube==0.7.5
+matplotlib
