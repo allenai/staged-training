@@ -12,11 +12,22 @@ Once you have a suitable Python environment, first install PyTorch v1.9.0 accord
 pip install -r requirements.txt
 ```
 
+Alternatively, you can run any of the scripts in this repository using Docker:
+
+```bash
+docker build -t staged-training:latest .
+docker run --rm --gpus all staged-training:latest NAME_OF_SCRIPT
+```
+
+## Computing the Optimal Schedule
+
+TODO
+
 ## Growth Operator
 
 Our growth operators (width/depth) each take as input the entire training state (including model parameters, optimizer state, learning rate schedule, etc.) and output a new training state from which training continues.
 
-Please see the `scripts/cheatsheet.txt` for more examples on how to use the corresponding scripts. 
+Please see the [`cheatsheet.txt`](./cheatsheet.txt) for more examples on how to use the corresponding scripts. 
 
 For example, you can apply the width operator with:
 ```
@@ -68,17 +79,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/gpt_pretrain.py \
 
 ## Evaluation
 
-Use `evaluation/eval_wikitext.py` or `evaluation/eval_lambada.py` to evaluate [GPT-2](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) on one of the supported datasets. For example:
+Use [`eval_wikitext.py`](./eval_wikitext.py) or [`eval_lambada.py`](./eval_lambada.py) to evaluate [GPT-2](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) on one of the supported datasets. For example:
 
 ```bash
-python evaluation/eval_wikitext.py
-```
-
-Or using Docker:
-
-```bash
-docker build -t evaluation:latest .
-docker run --rm --gpus all evaluation:latest evaluation/eval_wikitext.py
+python eval_wikitext.py
 ```
 
 ## Reference
