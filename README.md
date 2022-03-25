@@ -27,7 +27,7 @@ TODO
 
 Our growth operators (width/depth) each take as input the entire training state (including model parameters, optimizer state, learning rate schedule, etc.) and output a new training state from which training continues.
 
-Please see the [`cheatsheet.txt`](./cheatsheet.txt) for more examples on how to use the corresponding scripts. 
+Please see the [`cheatsheet.md`](./cheatsheet.md) for more examples on how to use the corresponding scripts. 
 
 For example, you can apply the width operator with:
 ```
