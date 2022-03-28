@@ -2,8 +2,8 @@ import torch
 from transformers import AutoModelForCausalLM
 from transformers.optimization import AdamW
 
-from gpt_pretrain import (double_matrix_weight, double_param,
-                          double_split_matrix_weight, double_weights)
+from tools.growth_operator import (double_matrix_weight, double_param,
+                                   double_split_matrix_weight, double_weights)
 
 
 def test_double_matrix_weight():

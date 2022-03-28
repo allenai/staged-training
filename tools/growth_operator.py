@@ -267,3 +267,32 @@ def deep_state_dict(old_state_dict, map_positions, is_identical):
             new_state_dict[key] = weight.detach().clone()
 
     return new_state_dict
+
+
+def double_weights(model, is_double_embedding):
+    config = model.config
+
+    # create an instance of the model twice the size
+    new_config_dict = config.to_dict()
+    new_config_dict["n_embd"] *= 2
+    new_config_dict["n_inner"] = (
+        new_config_dict["n_inner"] * 2
+        if new_config_dict["n_inner"] is not None
+        else None
+    )
+    new_config_dict["n_head"] *= 2
+
+    new_config = type(config).from_dict(new_config_dict)
+    new_model = type(model)(new_config)
+
+    # load the weights from the old model into new model after duplicating them
+    model.tie_weights()
+    new_model.tie_weights()
+
+    new_state_dict = double_state_dict(
+        model.state_dict(), is_double_embedding=is_double_embedding
+    )
+    new_model.load_state_dict(new_state_dict)
+    new_model.tie_weights()
+
+    return new_model
