@@ -32,7 +32,7 @@ Please see the [`cheatsheet.md`](./cheatsheet.md) for more examples on how to us
 For example, you can apply the width operator with:
 ```
 CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/gpt_pretrain.py \
-  --save_prefix final_gpt2_large_div2_width_check_bs512_lr0.0020_warmup3k_seqlen1024_debug \
+  --save_prefix final_gpt2_large_div2_width_x2 \
   --gpu_count -1 \
   --model gpt2  \
   --tokenizer gpt2 \
@@ -49,14 +49,15 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/gpt_pretrain.py \
   --num_workers 4 \
   --size GPT2_large_div2_width \
   --random \
-  --resume final_runs/final_gpt2_large_div2_width_check_bs512_lr0.0021_warmup3k_seqlen1024_debug/checkpoint-xxx.ckpt \
+  --resume gpt2_large_div2_width/checkpoint-xxx.ckpt \
   --doubling weights
 ```
 
 Or the depth operator with:
+
 ```
 CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/gpt_pretrain.py \
-  --save_prefix final_gpt2_large_div2_depthx2_check_bs512_lr0.0020_warmup3k_seqlen1024_debug \
+  --save_prefix final_gpt2_large_div2_depth_x2 \
   --gpu_count -1 \
   --model gpt2  \
   --tokenizer gpt2 \
@@ -73,9 +74,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/gpt_pretrain.py \
   --num_workers 4 \
   --size GPT2_large_div2_depth \
   --random \
-  --resume final_runs/final_gpt2_large_div2_depth_check_bs512_lr0.0020_warmup3k_seqlen1024_debug/checkpoint-epoch=0-step=6499.ckpt \
+  --resume final_gpt2_large_div2_depth/checkpoint-xxx.ckpt \
   --doubling layers
-``` 
+```
 
 ## Evaluation
 
