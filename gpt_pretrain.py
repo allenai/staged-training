@@ -1,39 +1,42 @@
 import argparse
+import copy
 import glob
-import os
-import re
-import random
 import logging
-import numpy as np
 import math
-from tqdm import tqdm
+import multiprocessing
+import os
+import random
+import re
 import time
-import torch
-from transformers import AutoTokenizer, AutoModelForMaskedLM, AutoModelForCausalLM
-from transformers import BertForMaskedLM, RobertaForMaskedLM, GPT2LMHeadModel
-from transformers import AutoConfig
-from transformers import DataCollatorForLanguageModeling
-from transformers.optimization import AdamW, get_linear_schedule_with_warmup
 
-from torch.utils.data import Dataset, DataLoader
+import numpy as np
 import pytorch_lightning as ptl
-from pytorch_lightning.trainer.training_loop import TrainLoop
+import torch
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers.test_tube import TestTubeLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
-from pytorch_lightning.trainer.connectors.checkpoint_connector import CheckpointConnector
+from pytorch_lightning.trainer.connectors.checkpoint_connector import \
+    CheckpointConnector
+from pytorch_lightning.trainer.training_loop import TrainLoop
 from pytorch_lightning.utilities import AMPType, rank_zero_warn
 from pytorch_lightning.utilities.exceptions import MisconfigurationException
-from pytorch_lightning.utilities.upgrade_checkpoint import KEYS_MAPPING as DEPRECATED_CHECKPOINT_KEYS
+from pytorch_lightning.utilities.upgrade_checkpoint import \
+    KEYS_MAPPING as DEPRECATED_CHECKPOINT_KEYS
 from torch.optim.lr_scheduler import LambdaLR
-import copy
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+from transformers import (AutoConfig, AutoModelForCausalLM,
+                          AutoModelForMaskedLM, AutoTokenizer, BertForMaskedLM,
+                          DataCollatorForLanguageModeling, GPT2LMHeadModel,
+                          RobertaForMaskedLM)
+from transformers.optimization import AdamW, get_linear_schedule_with_warmup
 
-import multiprocessing
 try:
     from apex import amp
 except ImportError:
     amp = None
 
 import tensorflow as tf
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -44,8 +47,18 @@ except ImportError:
 else:
     XLA_AVAILABLE = True
 
+from tools.growth_operator import double_param, double_state_dict
+
+
 # =======restart the linear warmup strategy with linear warmup==========
-def get_restart_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1, restart_warmup_steps=0, restart_steps=0):
+def get_restart_linear_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps,
+    num_training_steps,
+    last_epoch=-1,
+    restart_warmup_steps=0,
+    restart_steps=0,
+):
     """
     Create a schedule with a learning rate that decreases linearly from the initial lr set in the optimizer to 0, after
     a warmup period during which it increases linearly from 0 to the initial lr set in the optimizer.
@@ -58,419 +71,58 @@ def get_restart_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_tra
         num_training_steps (:obj:`int`):
             The total number of training steps.
         last_epoch (:obj:`int`, `optional`, defaults to -1):
-            The index of the last epoch when resuming training, will be modified. 
-        restart_warmup_steps: 
-            the restart_warmup_steps should be set last_epoch + restart_warmup_steps; 
+            The index of the last epoch when resuming training, will be modified.
+        restart_warmup_steps:
+            the restart_warmup_steps should be set last_epoch + restart_warmup_steps;
 
     Return:
         :obj:`torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule.
     """
 
     def lr_lambda(current_step: int):
-        
-        if restart_steps != 0 and restart_warmup_steps != 0 \
-            and current_step < restart_steps + restart_warmup_steps \
-            and current_step >= restart_steps:
+
+        if (
+            restart_steps != 0
+            and restart_warmup_steps != 0
+            and current_step < restart_steps + restart_warmup_steps
+            and current_step >= restart_steps
+        ):
             assert current_step >= restart_steps
 
             # pre-warmup + restart-warmup
             if current_step < num_warmup_steps:
-                return float(current_step - restart_steps) / float(max(1, restart_warmup_steps)) * float(restart_steps+restart_warmup_steps) / float(max(1, num_warmup_steps))
+                return (
+                    float(current_step - restart_steps)
+                    / float(max(1, restart_warmup_steps))
+                    * float(restart_steps + restart_warmup_steps)
+                    / float(max(1, num_warmup_steps))
+                )
             else:
-                return float(current_step - restart_steps) / float(max(1, restart_warmup_steps)) * float(num_training_steps - restart_steps-restart_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-            
+                return (
+                    float(current_step - restart_steps)
+                    / float(max(1, restart_warmup_steps))
+                    * float(num_training_steps - restart_steps - restart_warmup_steps)
+                    / float(max(1, num_training_steps - num_warmup_steps))
+                )
+
         if current_step < num_warmup_steps:
             return float(current_step) / float(max(1, num_warmup_steps))
         return max(
-            0.0, float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps))
+            0.0,
+            float(num_training_steps - current_step)
+            / float(max(1, num_training_steps - num_warmup_steps)),
         )
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
-
-# weights growth operator =================
-def double_split_matrix_weight(x, is_grad, is_avg_sq):
-    embed_dim = x.shape[0]
-    split_dim = x.shape[1] // x.shape[0]
-    y_shape = [2 * i for i in x.shape]
-    y = x.new_zeros(*y_shape)
-
-    for split_idx in range(split_dim):
-        start_idx, end_idx = split_idx * x.shape[0], (1+split_idx) * x.shape[0]
-        y_split = double_matrix_weight( x[:,start_idx:end_idx], is_grad, is_avg_sq )
-        y[:,start_idx*2:end_idx*2] = y_split.detach().clone()
-
-    return y
-
-def double_split_bias(x, embed_dim, is_grad, is_avg_sq):
-    split_dim = x.shape[0] // embed_dim
-    y_shape = [2 * i for i in x.shape]
-    y = x.new_zeros(*y_shape)
-
-    for split_idx in range(split_dim):
-        start_idx, end_idx = split_idx * embed_dim, (1+split_idx) * embed_dim
-        y[start_idx*2:start_idx*2+embed_dim] = x[start_idx:end_idx].detach().clone()
-        y[start_idx*2+embed_dim:end_idx*2] = x[start_idx:end_idx].detach().clone()
-    
-    if is_grad:
-        y /= 2.0 if not is_avg_sq else 4.0
-
-    return y
-
-def double_matrix_weight(x, is_grad, is_avg_sq):
-    # x = (n, m), returns y = (2 * n, 2 * m), used for FF layers
-    y_shape = [2 * i for i in x.shape]
-    y = x.new_zeros(*y_shape)
-
-    x_shape = x.shape
-    y[:x_shape[0], :x_shape[1]] = x.detach().clone()
-    y[-x_shape[0]:, -x_shape[1]:] = x.detach().clone()
-    if is_grad:
-        y /= 2.0 if not is_avg_sq else 4.0
-
-    
-    return y
-
-
-def double_bias(x, is_grad, is_avg_sq):
-    # x = (n, ), returns y = (2 * n, ), used for bias weights
-    y_shape = [2 * i for i in x.shape]
-    y = x.new_zeros(*y_shape)
-
-    x_shape = x.shape
-    
-    y[:x_shape[0]] = x.detach().clone()
-    y[-x_shape[0]:] = x.detach().clone()
-    if is_grad:
-        y /= 2.0 if not is_avg_sq else 4.0
-    
-    return y
-
-
-def double_embedding(x, is_grad, is_avg_sq):
-    # x = (vocab size, M), returns y = (vocab size, 2 * M), used for embedding layers
-    y_shape = [i for i in x.shape]
-    y_shape[1] *= 2
-    y = x.new_zeros(*y_shape)
-
-    x_shape = x.shape
-    y[:, :x_shape[1]] = x.detach().clone()
-    y[:, -x_shape[1]:] = x.detach().clone()
-    if is_grad:
-        y /= 2.0 if not is_avg_sq else 4.0
-    # if args.noise_std is not None and args.noise_std != 0.0:
-    #     y += torch.normal(mean=0, std=args.noise_std, size=y.shape)
-    return y
-
-
-def double_param(key, weight, is_double_embedding, is_grad, is_avg_sq):
-    if 'lm_head' in key:  # for roberta
-        # the lm_head is a linear layer then the softmax layer
-        if 'dense' in key:
-            # this is the linear layer - need to expand as other linear layers
-            if 'weight' in key:
-                return double_matrix_weight(weight, is_grad=is_grad, is_avg_sq=is_avg_sq)
-            elif 'bias' in key:
-                return double_bias(weight, is_grad=is_grad, is_avg_sq=is_avg_sq)
-
-        elif 'layer_norm' in key or 'ln' in key:
-            # layer norm is weight * (x - mean)/std + bias, so need to divide both weight and bias by 2.0
-            new_weight = double_bias(weight, is_grad=False, is_avg_sq=False)
-            if not is_grad:
-                new_weight /= 2.0
-            return new_weight
-        elif 'weight' in key:
-            return double_embedding(weight, is_grad=is_grad, is_avg_sq=is_avg_sq)
-        elif 'bias' in key:
-            # this is the bias parameter added for the final softmax logit, shape (vocab_size, )
-            return weight
-
-    elif 'pooler' in key:
-        # don't think this pooler is used without next-sentence-prediction in bert, but we'll double it anyway
-        if 'weight' in key:
-            return double_matrix_weight(weight, is_grad=is_grad, is_avg_sq=is_avg_sq)
-        elif 'bias' in key:
-            return double_bias(weight, is_grad=is_grad, is_avg_sq=is_avg_sq)
-
-    elif 'cls' in key:
-        # the masked LM head.
-        # in BERT it is top layer activations -> dense with same hidden dim -> activation -> layer norm -> decoder
-        # where the decoder is linear that has the same weights as the word embeddings and a new bias layer
-        # to maintain the same loss, we want the logit outputs to remain the same - so can do it by duplicating
-        # the word embeddings / bias, and dividing the input by 2.  We accomplish the two division by modifying the
-        # layer norm parameters right before prediction.
-        #
-        # cls.predictions.bias torch.Size([30522])
-        # cls.predictions.transform.dense.weight torch.Size([768, 768])
-        # cls.predictions.transform.dense.bias torch.Size([768])
-        # cls.predictions.transform.LayerNorm.weight torch.Size([768])
-        # cls.predictions.transform.LayerNorm.bias torch.Size([768])
-        # cls.predictions.decoder.weight torch.Size([30522, 768])
-        # cls.predictions.decoder.bias torch.Size([30522])
-        if key.endswith('cls.predictions.bias') or key.endswith('cls.predictions.decoder.bias'):
-            # these are size(vocab) and remain unchanged
-            return weight
-        elif key.endswith('cls.predictions.transform.dense.bias'):
-            return double_bias(weight, is_grad=is_grad, is_avg_sq=is_avg_sq)
-        elif key.endswith('cls.predictions.transform.dense.weight'):
-            return double_matrix_weight(weight, is_grad=is_grad, is_avg_sq=is_avg_sq)
-        elif key.endswith('cls.predictions.decoder.weight'):
-            return double_embedding(weight, is_grad=is_grad, is_avg_sq=is_avg_sq)
-        elif 'LayerNorm' in key:
-            # layer norm is weight * (x - mean)/std + bias, so need to divide both weight and bias by 2.0
-            new_weight = double_bias(weight, is_grad=False, is_avg_sq=False)
-            if not is_grad:
-                new_weight /= 2.0
-            return new_weight
-
-    elif 'word_embeddings' in key or 'position_embeddings' in key or 'token_type_embeddings' in key \
-        or "wte.weight" in key or "wpe.weight" in key:
-        if is_double_embedding:
-            return double_embedding(weight, is_grad=is_grad, is_avg_sq=is_avg_sq)
-        else:
-            return weight.detach().clone()
-    elif "masked_bias" in key or ("attn.bias"  in key and len(weight.shape) != 1):
-        return weight.detach().clone()
-    elif "c_attn.weight" in key:
-        return double_split_matrix_weight(weight, is_grad=is_grad, is_avg_sq=is_avg_sq)
-    elif "c_attn.bias" in key:
-        # TODO: this is hacked for GPT2
-        return double_split_bias(weight, embed_dim=weight.shape[0] // 3, is_grad=is_grad, is_avg_sq=is_avg_sq)
-    elif 'query.weight' in key or 'key.weight' in key or 'value.weight' in key or 'dense.weight' in key \
-        or "c_proj.weight" in key or "c_fc.weight" in key:
-        return double_matrix_weight(weight, is_grad=is_grad, is_avg_sq=is_avg_sq)
-    elif "ln_f" in key:
-        new_weight = double_bias(weight, is_grad=False, is_avg_sq=False)
-        if not is_grad:
-            new_weight /= 2.0
-        return new_weight
-    elif 'LayerNorm' in key or 'bias' in key or 'ln' in key:
-        return double_bias(weight, is_grad=is_grad, is_avg_sq=is_avg_sq)
-    elif 'position_ids' in key:
-        return weight
-
-    # Not found
-    print(key)
-    import ipdb; ipdb.set_trace()
-    # raise ValueError(key, weight.shape)
-
-
-def double_state_dict(old_state_dict, is_double_embedding):
-    new_state_dict = {}
-    for key, weight in old_state_dict.items():
-        new_state_dict[key] = double_param(key, weight, is_double_embedding=is_double_embedding, is_grad=False, is_avg_sq=False)
-    return new_state_dict
-
-# depth growth operator
-def deep_split_matrix_weight(x, is_identical, is_grad, is_avg_sq):
-    if not is_identical:
-        return x.detach().clone()
-
-    embed_dim = x.shape[0]
-    split_dim = x.shape[1] // x.shape[0]
-    y_shape = [i for i in x.shape]
-    y = x.new_zeros(*y_shape)
-
-    for split_idx in range(split_dim):
-        start_idx, end_idx = split_idx * x.shape[0], (1+split_idx) * x.shape[0]
-        y_split = deep_matrix_weight( x[:,start_idx:end_idx], is_identical, is_grad, is_avg_sq )
-        y[:,start_idx:end_idx] = y_split.detach().clone()
-
-    return y
-
-def deep_matrix_weight(x, is_identical, is_grad, is_avg_sq):
-    # x = (n, m), returns y = (2 * n, 2 * m), used for FF layers
-    if is_identical:
-        y = torch.zeros_like(x)
-        if len(y.shape) > 1:
-            y.fill_diagonal_(1)
-        return y
-    else:
-        return x.detach().clone()
-
-
-def deep_bias(x, is_identical, is_grad, is_avg_sq):
-    # x = (n, ), returns y = (2 * n, ), used for bias weights
-    if is_identical:
-        return torch.zeros_like(x)
-    else:
-        return x.detach().clone()
-
-def deep_param(key, weight, is_identical, is_grad, is_avg_sq):
-    if "c_attn.weight" in key:
-        return deep_split_matrix_weight(weight, is_identical=is_identical, is_grad=is_grad, is_avg_sq=is_avg_sq)
-    elif 'weight' in key:
-        return deep_matrix_weight(weight, is_identical=is_identical, is_grad=is_grad, is_avg_sq=is_avg_sq)
-    elif 'bias' in key:
-        return deep_bias(weight, is_identical=is_identical, is_grad=is_grad, is_avg_sq=is_avg_sq)
-
-def deep_state_dict(old_state_dict, map_positions, is_identical):
-    # how to insert layers: direct copy, identical copy
-    # operator over the blocks: hacked for GPT-3
-    new_state_dict = {}
-    for key, weight in old_state_dict.items():
-        if map_positions.get( key ):
-            for (new_key, new_key_copy_flag) in map_positions.get( key ):
-                # print( new_key_copy_flag, is_identical, new_key, key )
-                new_state_dict[new_key] = deep_param(key, weight, is_identical=new_key_copy_flag and is_identical, is_grad=False, is_avg_sq=False)
-        else:
-            new_state_dict[key] = weight.detach().clone()
-
-    return new_state_dict
-
-
-def test_double_matrix_weight():
-    weight = torch.rand(52, 88)
-    x = torch.rand(88, 1)
-    reset_model_opt_copy=True
-    weight2 = double_matrix_weight(weight, is_grad=False, is_avg_sq=False, reset_model_opt_copy=reset_model_opt_copy)
-    y = torch.matmul(weight, x)
-    y2 = torch.matmul(weight2, torch.cat([x, x], dim=0))
-    print(torch.allclose(y, y2[:52], atol=1e-05, rtol=1e-03))
-    assert torch.abs(y - y2[:52]).max() + torch.abs(y - y2[-52:]).max() < 1e-4
-
-    x = torch.rand(1, 11)
-    c_attn = torch.rand(11, 11*3)
-    print(len(torch.matmul(x, c_attn).split(11, dim=1)))
-    y0, y1, y2 = torch.matmul(x, c_attn).split(11, dim=1)
-
-    c_attn2 = double_split_matrix_weight(c_attn, is_grad=False, is_avg_sq=False, reset_model_opt_copy=reset_model_opt_copy)
-
-    y00, y11, y22 = torch.matmul(torch.cat([x, x], dim=1), c_attn2).split(11*2, dim=1)
-
-    allcose = torch.allclose(y0, y00[:, :11], atol=1e-05, rtol=1e-03)
-    print("reset_model_opt_copy", reset_model_opt_copy, allcose, y0.sum(), y00[:, :11].sum(), y00[:, 11:].sum())
-    if not allcose:
-        import ipdb; ipdb.set_trace()
-    # import ipdb; ipdb.set_trace()
-
-
-def test_double_gradients():
-    test_double_matrix_weight()
-    # config = AutoConfig.from_pretrained('roberta-base')
-    # config.hidden_size = 4
-    # config.intermediate_size = 16
-    # config.max_position_embeddings = 8
-    # config.num_attention_heads = 1
-    # config.num_hidden_layers = 1
-    # config.vocab_size = 6
-
-    # config.attention_probs_dropout_prob = 0
-    # config.hidden_dropout_prob = 0
-    # model = RobertaForMaskedLM(config=config)
-
-    from gpt_pretrain import double_weights, double_param
-    from transformers import AutoConfig, RobertaForMaskedLM, AutoModelForMaskedLM
-    from transformers.optimization import AdamW, get_linear_schedule_with_warmup
-    import torch
-    # model = AutoModelForMaskedLM.from_pretrained('bert-base-uncased')
-    model = AutoModelForCausalLM.from_pretrained('gpt2')
-
-    optimizer = AdamW(model.parameters(), lr=0.00000, betas=(0.0, 0.0))
-    model.eval()
-    input_ids = torch.tensor([[1, 2, 3, 4]])
-    labels = torch.tensor([[1, 2, 3, 4]])
-    loss = model(input_ids=input_ids, labels=labels)[0]
-    loss.backward()
-    optimizer.step()
-    # model.roberta.embeddings.word_embeddings.weight.grad
-    reset_model_opt_copy=True
-    reset_model_noise=False
-    double_model = double_weights(model, is_double_embedding=True, reset_model_opt_copy=reset_model_opt_copy,reset_model_noise=reset_model_noise)
-    double_optimizer = AdamW(double_model.parameters(), lr=0.00000, betas=(0.0, 0.0))
-    double_model.eval()
-    double_loss = double_model(input_ids=input_ids, labels=labels)[0]
-    double_loss.backward()
-    double_optimizer.step()
-
-    print(double_loss.item(), loss.item(), torch.allclose(double_loss, loss, atol=1e-05, rtol=1e-03))
-    assert torch.allclose(double_loss, loss, atol=1e-05, rtol=1e-03)
-    # exit()
-    for (name, parameter), (double_name, double_parameter), (opt_key, opt_val), (double_opt_key, double_opt_val) in  \
-            zip(model.named_parameters(), double_model.named_parameters(),
-                optimizer.state.items(), double_optimizer.state.items()):
-        assert name == double_name
-        assert id(parameter) == id(opt_key)
-        assert id(double_parameter) == id(double_opt_key)
-        predicted = double_param(name, parameter.grad, is_double_embedding=True, is_grad=True, is_avg_sq=False, reset_optimizer_copy=True, reset_model_opt_copy=reset_model_opt_copy)
-        all_close = torch.allclose(predicted, double_parameter.grad, atol=1e-05, rtol=1e-03)
-
-        if not all_close:
-            print('1', all_close, name, parameter.shape, )
-            print(predicted)
-            print(double_parameter.grad)
-
-        predicted = double_param(name, opt_val['exp_avg'], is_double_embedding=True, is_grad=True, is_avg_sq=False, reset_optimizer_copy=True, reset_model_opt_copy=reset_model_opt_copy)
-        all_close = torch.allclose(predicted, double_opt_val['exp_avg'], atol=1e-05, rtol=1e-03)
-        if not all_close:
-            print('2', all_close, name, parameter.shape, )
-            print(predicted)
-            print(double_opt_val['exp_avg'],)
-
-        predicted = double_param(name, opt_val['exp_avg_sq'], is_double_embedding=True, is_grad=True, is_avg_sq=True, reset_optimizer_copy=True, reset_model_opt_copy=reset_model_opt_copy)
-        all_close = torch.allclose(predicted, double_opt_val['exp_avg_sq'], atol=1e-05, rtol=1e-03)
-        if not all_close:
-            print('3', all_close, name, parameter.shape, )
-            print(predicted)
-            print(double_opt_val['exp_avg_sq'],)
-            import ipdb; ipdb.set_trace()
-        else:
-            print('3', all_close, name, parameter.shape, )
-
-
-    import ipdb; ipdb.set_trace()
-
-def double_weights(model, is_double_embedding):
-    print(model)
-    config = model.config
-
-    # create an instance of the model twice the size
-    new_config_dict = config.to_dict()
-    new_config_dict['n_embd'] *= 2
-    new_config_dict['n_inner'] = new_config_dict['n_inner']*2 if new_config_dict['n_inner'] is not None else None
-    new_config_dict['n_head'] *= 2
-
-    new_config = type(config).from_dict(new_config_dict)
-    new_model = type(model)(new_config)
-
-    # load the weights from the old model into new model after duplicating them
-    model.tie_weights()
-    new_model.tie_weights()
-
-    new_state_dict = double_state_dict(model.state_dict(), is_double_embedding=is_double_embedding)
-    new_model.load_state_dict(new_state_dict)
-    new_model.tie_weights()
-
-    return new_model
-
-
-def double_depth(model):
-    print(model)
-    config = model.config
-
-    # create an instance of the model twice the size
-    new_config_dict = config.to_dict()
-    print(new_config_dict)
-    new_config_dict['num_hidden_layers'] *= 2
-
-    new_config = type(config).from_dict(new_config_dict)
-    new_model = type(model)(new_config)
-
-    # load the weights from the old model into new model after duplicating them
-    model.tie_weights()
-    new_model.tie_weights()
-
-    new_state_dict = deep_state_dict(model.state_dict())
-    new_model.load_state_dict(new_state_dict)
-    new_model.tie_weights()
-
-    return new_model
 
 
 # the dataset object we are using
 class MMapTextDataset(Dataset):
     def __init__(self, mmap_filename, chunk_size, bos_token_id, eos_token_id):
         # `chunk_size - 2` to reserve space for <s> and </s>
-        self.num_instances = np.memmap(mmap_filename, mode='r', dtype=np.uint16).shape[0] // (chunk_size - 2)
+        self.num_instances = np.memmap(mmap_filename, mode="r", dtype=np.uint16).shape[
+            0
+        ] // (chunk_size - 2)
         # defer loading the token_ids memmap until after the first __getitem__ call.
         # when spawning new processes for ddp, there is a hard limit in python < 3.8 that
         # pickle files need to be < 4GB. By waiting until after the first __getitem__ we
@@ -486,23 +138,29 @@ class MMapTextDataset(Dataset):
 
     def __getitem__(self, i):
         if self.token_ids is None:
-            self.token_ids = np.memmap(self._mmap_filename, mode='r', dtype=np.uint16)
+            self.token_ids = np.memmap(self._mmap_filename, mode="r", dtype=np.uint16)
         from_index = i * (self._chunk_size - 2)
         to_index = (i + 1) * (self._chunk_size - 2)
-        data = np.concatenate(([self._bos_token_id], self.token_ids[from_index:to_index], [self._eos_token_id]))
+        data = np.concatenate(
+            (
+                [self._bos_token_id],
+                self.token_ids[from_index:to_index],
+                [self._eos_token_id],
+            )
+        )
         return torch.tensor(data, dtype=torch.long)
 
     # ========================= preprocessing code ========================= #
     @staticmethod
     def _process_file(full_fname):
         "Step 1: tokenize an input text file then save token ids into `np.memmap` shards of size `args.shard_size`"
-        fname = full_fname.split('/')[-1]
-        if args.data_type == 'tfrecord':
-            log_filename = f'{args.output_dir}/logs-{fname}.log'
-        elif args.data_type == 'raw_text':
-            log_filename = f'{args.output_dir}/logs-{args.shard_size}/{fname}.log'
+        fname = full_fname.split("/")[-1]
+        if args.data_type == "tfrecord":
+            log_filename = f"{args.output_dir}/logs-{fname}.log"
+        elif args.data_type == "raw_text":
+            log_filename = f"{args.output_dir}/logs-{args.shard_size}/{fname}.log"
         if os.path.isfile(log_filename):
-            logging.info(f'Skipping {full_fname} ...')
+            logging.info(f"Skipping {full_fname} ...")
             return  # log file already exists. Skip current file.
 
         if args.num_workers > 1:
@@ -512,35 +170,41 @@ class MMapTextDataset(Dataset):
             process_identity = 1
 
         if process_identity == 1:
-            logging.info(f'Processing {full_fname} ...')
+            logging.info(f"Processing {full_fname} ...")
 
         def _write_shard():
             if len(token_list) == 0:
                 return
             # if token_list[-1] != MMapTextDataset.tokenizer.sep_token_id:  # handle a rare case
             #     token_list.append(MMapTextDataset.tokenizer.sep_token_id)
-            if args.data_type in ['tfrecord', 's2']:
-                shared_filename = f'{args.output_dir}/{fname}.bin'
-            elif args.data_type == 'raw_text':
-                shared_filename = f'{args.output_dir}/shards-{args.shard_size}/{fname}-{shard_count}.bin'
+            if args.data_type in ["tfrecord", "s2"]:
+                shared_filename = f"{args.output_dir}/{fname}.bin"
+            elif args.data_type == "raw_text":
+                shared_filename = f"{args.output_dir}/shards-{args.shard_size}/{fname}-{shard_count}.bin"
             else:
                 raise NotImplementedError
-            logging.info(f'Writing {len(token_list)} tokens to shared {shared_filename}')
-            fp = np.memmap(shared_filename, dtype=np.uint16, mode='w+', shape=len(token_list))
+            logging.info(
+                f"Writing {len(token_list)} tokens to shared {shared_filename}"
+            )
+            fp = np.memmap(
+                shared_filename, dtype=np.uint16, mode="w+", shape=len(token_list)
+            )
             fp[:] = token_list[:]
             del fp  # flush and close file
-    
+
         token_list = []
         shard_count = 0
-        tokens_count = 0    
+        tokens_count = 0
 
-        if args.data_type == 'raw_text':  # the input file is one doc per line
-            with open(full_fname, 'r') as fin:
+        if args.data_type == "raw_text":  # the input file is one doc per line
+            with open(full_fname, "r") as fin:
                 for line in tqdm(fin):
                     line = line.strip()
-                    if line == '':  # drop empty lines
+                    if line == "":  # drop empty lines
                         continue
-                    tokens = MMapTextDataset.tokenizer.encode(line, add_special_tokens=False)  # `__getitem__` adds special tokens
+                    tokens = MMapTextDataset.tokenizer.encode(
+                        line, add_special_tokens=False
+                    )  # `__getitem__` adds special tokens
                     token_list.extend(tokens)
                     if len(token_list) > args.shard_size:
                         _write_shard()
@@ -551,14 +215,20 @@ class MMapTextDataset(Dataset):
                         token_list.append(MMapTextDataset.tokenizer.sep_token_id)
                 _write_shard()
                 tokens_count += len(token_list)
-        elif args.data_type == 'tfrecord':  # the input file is tfrecord format of the c4 dataset
+        elif (
+            args.data_type == "tfrecord"
+        ):  # the input file is tfrecord format of the c4 dataset
             fin = tf.data.TFRecordDataset(full_fname)
             for raw_example in tqdm(iter(fin), disable=process_identity != 1):
                 parsed = tf.train.Example.FromString(raw_example.numpy())
                 feature_keys = set(parsed.features.feature.keys())
-                if 'text' in feature_keys:
-                    line = parsed.features.feature['text'].bytes_list.value[0].decode()  # raw text 
-                    tokens = MMapTextDataset.tokenizer.encode(line, add_special_tokens=False)  # `__getitem__` adds special tokens
+                if "text" in feature_keys:
+                    line = (
+                        parsed.features.feature["text"].bytes_list.value[0].decode()
+                    )  # raw text
+                    tokens = MMapTextDataset.tokenizer.encode(
+                        line, add_special_tokens=False
+                    )  # `__getitem__` adds special tokens
                     if args.add_sep_after_doc:
                         tokens.append(MMapTextDataset.tokenizer.sep_token_id)
                     token_list.extend(tokens)
@@ -566,23 +236,23 @@ class MMapTextDataset(Dataset):
                 shard_count += 1
             _write_shard()
 
-        with open(log_filename, 'w') as f:
-            f.write(f'Generated {tokens_count} tokens in {shard_count + 1} shards')
+        with open(log_filename, "w") as f:
+            f.write(f"Generated {tokens_count} tokens in {shard_count + 1} shards")
 
     @staticmethod
     def _combine_shards(output_fname, shards_list):
         "Step 2: combining memmap shards into one `train.bin` or `val.bin` file"
         total_size = 0
         for filename in shards_list:
-            total_size += np.memmap(filename, mode='r', dtype=np.uint16).shape[0]
-        logging.info(f'Writing {total_size} tokens to {output_fname}')
+            total_size += np.memmap(filename, mode="r", dtype=np.uint16).shape[0]
+        logging.info(f"Writing {total_size} tokens to {output_fname}")
         all_token_ids = np.empty(total_size, dtype=np.uint16)
         last_token_index = 0
         for filename in tqdm(shards_list):
-            shared = np.memmap(filename, mode='r', dtype=np.uint16)
-            all_token_ids[last_token_index:last_token_index+len(shared)] = shared[:]
+            shared = np.memmap(filename, mode="r", dtype=np.uint16)
+            all_token_ids[last_token_index : last_token_index + len(shared)] = shared[:]
             last_token_index += len(shared)
-        fp = np.memmap(output_fname, dtype=np.uint16, mode='w+', shape=total_size)
+        fp = np.memmap(output_fname, dtype=np.uint16, mode="w+", shape=total_size)
         fp[:] = all_token_ids[:]
         del fp
 
@@ -604,56 +274,85 @@ class MMapTextDataset(Dataset):
             >>> python scripts/pretrain.py --input_dir dirWithTextFiles --train_dev_split 0.05  \
                                            --shard_size  268435456  --num_preprocessing_workers 16
         """
-        MMapTextDataset.tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
-        assert len(MMapTextDataset.tokenizer) < 65535  # will use uint16 to store token ids
-        all_files = glob.glob(f'{args.input_dir}/c4-*')
+        MMapTextDataset.tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer, use_fast=True
+        )
+        assert (
+            len(MMapTextDataset.tokenizer) < 65535
+        )  # will use uint16 to store token ids
+        all_files = glob.glob(f"{args.input_dir}/c4-*")
         print(len(all_files), MMapTextDataset.tokenizer)
-        if os.path.exists(f'{args.output_dir}/cache/train.bin') and os.path.exists(f'{args.input_dir}/cache/val.bin'):
-            logger.info("Cache already exists. Remove the cache directory to regenerate")
+        if os.path.exists(f"{args.output_dir}/cache/train.bin") and os.path.exists(
+            f"{args.input_dir}/cache/val.bin"
+        ):
+            logger.info(
+                "Cache already exists. Remove the cache directory to regenerate"
+            )
             return
         try:
-            os.mkdir(f'{args.output_dir}/cache/')
+            os.mkdir(f"{args.output_dir}/cache/")
         except FileExistsError:
             pass
         try:
-            os.mkdir(f'{args.output_dir}/shards-{args.shard_size}/')
+            os.mkdir(f"{args.output_dir}/shards-{args.shard_size}/")
         except FileExistsError:
             pass
         try:
-            os.mkdir(f'{args.output_dir}/logs-{args.shard_size}/')  # log progrss to be able to resume
+            os.mkdir(
+                f"{args.output_dir}/logs-{args.shard_size}/"
+            )  # log progrss to be able to resume
         except FileExistsError:
             pass
 
         # STEP1: tokenizing and saving to shards
         if args.num_preprocessing_workers > 1:
             from multiprocessing.pool import Pool
+
             with Pool(args.num_preprocessing_workers) as p:
-                list(tqdm(p.imap(MMapTextDataset._process_file, all_files), total=len(all_files)))
+                list(
+                    tqdm(
+                        p.imap(MMapTextDataset._process_file, all_files),
+                        total=len(all_files),
+                    )
+                )
         else:
             [MMapTextDataset._process_file(f) for f in tqdm(all_files)]
 
-        if args.data_type == 'raw_text':  # c4 tfrecords are already sharded
+        if args.data_type == "raw_text":  # c4 tfrecords are already sharded
             # STEP2: shuffling shards and combining them into train.bin and val.bin files
-            all_shards = glob.glob(f'{args.output_dir}/shards-{args.shard_size}/*.bin')
+            all_shards = glob.glob(f"{args.output_dir}/shards-{args.shard_size}/*.bin")
             random.shuffle(all_shards)  # shuffling based on shards not individual lines
             val_shards_count = int(args.train_dev_split * len(all_shards))
             val_shards = all_shards[:val_shards_count]
             train_shards = all_shards[val_shards_count:]
             # TODO: if MMapTextDataset._combining_shards is very slow for large files, it can be skipped but we nned to
             # update the dataset to read from multiple shards directly
-            MMapTextDataset._combine_shards(f'{args.output_dir}/cache/val.bin', val_shards)
-            MMapTextDataset._combine_shards(f'{args.output_dir}/cache/train.bin', train_shards)
-        elif args.data_type == 'tfrecord':
-            train_shards = glob.glob(f'{args.output_dir}/*train*.bin')
-            val_shards = glob.glob(f'{args.output_dir}/*val*.bin')
-            MMapTextDataset._combine_shards(f'{args.output_dir}/val.bin', val_shards)
-            MMapTextDataset._combine_shards(f'{args.output_dir}/train.bin', train_shards)
+            MMapTextDataset._combine_shards(
+                f"{args.output_dir}/cache/val.bin", val_shards
+            )
+            MMapTextDataset._combine_shards(
+                f"{args.output_dir}/cache/train.bin", train_shards
+            )
+        elif args.data_type == "tfrecord":
+            train_shards = glob.glob(f"{args.output_dir}/*train*.bin")
+            val_shards = glob.glob(f"{args.output_dir}/*val*.bin")
+            MMapTextDataset._combine_shards(f"{args.output_dir}/val.bin", val_shards)
+            MMapTextDataset._combine_shards(
+                f"{args.output_dir}/train.bin", train_shards
+            )
         del MMapTextDataset.tokenizer
+
     # ========================= end preprocessing code ========================= #
 
 
 class MyCheckpointConnector(CheckpointConnector):
-    def __init__(self, trainer, reset_optimizer=False, reset_lr_scheduler=False, set_global_step=None):
+    def __init__(
+        self,
+        trainer,
+        reset_optimizer=False,
+        reset_lr_scheduler=False,
+        set_global_step=None,
+    ):
         super().__init__(trainer)
         self.reset_optimizer = reset_optimizer
         self.reset_lr_scheduler = reset_lr_scheduler
@@ -665,10 +364,10 @@ class MyCheckpointConnector(CheckpointConnector):
         and updated to support reset_optimizer and reset_lr_scheduler
         """
         # validation
-        if 'optimizer_states' not in checkpoint or 'lr_schedulers' not in checkpoint:
+        if "optimizer_states" not in checkpoint or "lr_schedulers" not in checkpoint:
             raise KeyError(
-                'Trying to restore training state but checkpoint contains only the model.'
-                ' This is probably due to `ModelCheckpoint.save_weights_only` being set to `True`.'
+                "Trying to restore training state but checkpoint contains only the model."
+                " This is probably due to `ModelCheckpoint.save_weights_only` being set to `True`."
             )
 
         if any([key in checkpoint for key in DEPRECATED_CHECKPOINT_KEYS]):
@@ -680,18 +379,24 @@ class MyCheckpointConnector(CheckpointConnector):
             )
 
         # restore amp scaling
-        if self.trainer.amp_backend == AMPType.NATIVE and 'native_amp_scaling_state' in checkpoint:
-            self.trainer.scaler.load_state_dict(checkpoint['native_amp_scaling_state'])
-        elif self.trainer.amp_backend == AMPType.APEX and 'amp_scaling_state' in checkpoint:
-            amp.load_state_dict(checkpoint['amp_scaling_state'])
+        if (
+            self.trainer.amp_backend == AMPType.NATIVE
+            and "native_amp_scaling_state" in checkpoint
+        ):
+            self.trainer.scaler.load_state_dict(checkpoint["native_amp_scaling_state"])
+        elif (
+            self.trainer.amp_backend == AMPType.APEX
+            and "amp_scaling_state" in checkpoint
+        ):
+            amp.load_state_dict(checkpoint["amp_scaling_state"])
 
         # restore callback states
         self.trainer.on_load_checkpoint(checkpoint)
 
-        self.trainer.global_step = checkpoint['global_step']
+        self.trainer.global_step = checkpoint["global_step"]
         if self.set_global_step is not None:
             self.trainer.global_step = self.set_global_step
-        self.trainer.current_epoch = checkpoint['epoch']
+        self.trainer.current_epoch = checkpoint["epoch"]
 
         # crash if max_epochs is lower then the current epoch from the checkpoint
         if self.trainer.current_epoch > self.trainer.max_epochs:
@@ -703,9 +408,16 @@ class MyCheckpointConnector(CheckpointConnector):
 
         # Division deals with global step stepping once per accumulated batch
         # Inequality deals with different global step for odd vs even num_training_batches
-        n_accum = 1 if self.trainer.accumulate_grad_batches is None else self.trainer.accumulate_grad_batches
+        n_accum = (
+            1
+            if self.trainer.accumulate_grad_batches is None
+            else self.trainer.accumulate_grad_batches
+        )
         expected_steps = self.trainer.num_training_batches / n_accum
-        if self.trainer.num_training_batches != 0 and self.trainer.global_step % expected_steps > 1:
+        if (
+            self.trainer.num_training_batches != 0
+            and self.trainer.global_step % expected_steps > 1
+        ):
             rank_zero_warn(
                 "You're resuming from a checkpoint that ended mid-epoch. "
                 "This can cause unreliable results if further training is done, "
@@ -717,12 +429,12 @@ class MyCheckpointConnector(CheckpointConnector):
 
         # restore the optimizers
         if not self.reset_optimizer:
-            optimizer_states = checkpoint['optimizer_states']
+            optimizer_states = checkpoint["optimizer_states"]
             for optimizer, opt_state in zip(self.trainer.optimizers, optimizer_states):
                 print(opt_state.keys(), optimizer)
                 # print(optimizer.param_groups.keys(), optimizer.param_groups)
                 print([x.keys() for x in optimizer.param_groups])
-                print([x.keys() for x in opt_state['param_groups']])
+                print([x.keys() for x in opt_state["param_groups"]])
                 optimizer.load_state_dict(opt_state)
 
                 # move optimizer to GPU 1 weight at a time
@@ -735,19 +447,19 @@ class MyCheckpointConnector(CheckpointConnector):
 
         if not self.reset_lr_scheduler:
             # restore the lr schedulers
-            lr_schedulers = checkpoint['lr_schedulers']
+            lr_schedulers = checkpoint["lr_schedulers"]
             if self.set_global_step is not None:
                 for lrs_state in lr_schedulers:
-                    lrs_state['last_epoch'] = self.set_global_step
-                    lrs_state['_step_count'] = self.set_global_step + 1
+                    lrs_state["last_epoch"] = self.set_global_step
+                    lrs_state["_step_count"] = self.set_global_step + 1
 
             for scheduler, lrs_state in zip(self.trainer.lr_schedulers, lr_schedulers):
-                scheduler['scheduler'].load_state_dict(lrs_state)
+                scheduler["scheduler"].load_state_dict(lrs_state)
         else:
             if self.set_global_step is not None:
                 for scheduler in self.trainer.lr_schedulers:
-                    scheduler['scheduler'].last_epoch = self.set_global_step
-                    scheduler['scheduler']._step_count = self.set_global_step+ 1
+                    scheduler["scheduler"].last_epoch = self.set_global_step
+                    scheduler["scheduler"]._step_count = self.set_global_step + 1
 
 
 # rewrite the MyTrainLoop from pytorch-lightning to support batch size and sequence length warmup
@@ -777,10 +489,14 @@ class MyTrainLoop(TrainLoop):
             if not should_accumulate:
                 # param_norm = float(p.grad.data.norm(norm_type))
                 p_grad = p.grad.data / args.batch_size / args.grad_accum
-                param_norm = float( p_grad.norm(norm_type) )
+                param_norm = float(p_grad.norm(norm_type))
             else:
-                p_grad = p.grad.data / self.trainer.accelerator.precision_plugin.scaler.get_scale() / args.batch_size 
-                param_norm = float( p_grad.norm(norm_type) )
+                p_grad = (
+                    p.grad.data
+                    / self.trainer.accelerator.precision_plugin.scaler.get_scale()
+                    / args.batch_size
+                )
+                param_norm = float(p_grad.norm(norm_type))
             all_norms.append(param_norm)
             # local_norm.add_(p.grad.norm(norm_type))
 
@@ -788,9 +504,16 @@ class MyTrainLoop(TrainLoop):
         # norms[f'grad_{norm_type}_norm_total'] = round(total_norm, 4)
         # print("total_norm", total_norm, model.device, local_norm, self.trainer.accelerator.precision_plugin.scaler.get_scale())
         if not should_accumulate:
-            return {'total_grad_norm': total_norm, "batch_size": args.batch_size * self.trainer.world_size, "grad_accum": args.grad_accum }
+            return {
+                "total_grad_norm": total_norm,
+                "batch_size": args.batch_size * self.trainer.world_size,
+                "grad_accum": args.grad_accum,
+            }
         else:
-            return { "local_grad_norm %s" % model.device: total_norm, "local_scale": self.trainer.accelerator.precision_plugin.scaler.get_scale() }
+            return {
+                "local_grad_norm %s" % model.device: total_norm,
+                "local_scale": self.trainer.accelerator.precision_plugin.scaler.get_scale(),
+            }
 
     def _track_gradient_norm(self):
         grad_norm_dict = {}
@@ -807,52 +530,79 @@ class MyTrainLoop(TrainLoop):
         # print(should_accumulate)
         # backward can be called manually in the training loop
         if isinstance(result, torch.Tensor):
-            self.trainer.accelerator.backward(result, optimizer, opt_idx, should_accumulate, *args, **kwargs)
+            self.trainer.accelerator.backward(
+                result, optimizer, opt_idx, should_accumulate, *args, **kwargs
+            )
         else:
             result.closure_loss = self.trainer.accelerator.backward(
-                result.closure_loss, optimizer, opt_idx, should_accumulate, *args, **kwargs
+                result.closure_loss,
+                optimizer,
+                opt_idx,
+                should_accumulate,
+                *args,
+                **kwargs,
             )
 
         if not self.should_accumulate():
             # track gradients
             # print("track gradient with should_accumulate False")
             cur_grad_norm_dict = self.track_and_norm_grad(optimizer=optimizer)
-            if 'total_grad_norm' in self._cur_grad_norm_dict:
-                B_small, B_big = self._cur_grad_norm_dict['batch_size'], self._cur_grad_norm_dict['batch_size'] * self._cur_grad_norm_dict['grad_accum']
-                grad_norm_B_big = self._cur_grad_norm_dict['total_grad_norm']
+            if "total_grad_norm" in self._cur_grad_norm_dict:
+                B_small, B_big = (
+                    self._cur_grad_norm_dict["batch_size"],
+                    self._cur_grad_norm_dict["batch_size"]
+                    * self._cur_grad_norm_dict["grad_accum"],
+                )
+                grad_norm_B_big = self._cur_grad_norm_dict["total_grad_norm"]
                 grad_norm_B_small = []
-                if not hasattr(self, 'grad_norm_dict') or (hasattr(self, 'grad_norm_dict') and self.grad_norm_dict is None):
+                if not hasattr(self, "grad_norm_dict") or (
+                    hasattr(self, "grad_norm_dict") and self.grad_norm_dict is None
+                ):
                     B_critical = B_big
                 else:
                     for item in self.grad_norm_dict:
                         if "local_grad_norm" in item:
-                            grad_norm_B_small.append( self.grad_norm_dict[item] )
+                            grad_norm_B_small.append(self.grad_norm_dict[item])
 
                     grad_norm_B_small = np.average(grad_norm_B_small)
-                    g2 = 1 / (B_big-B_small) * (B_big * grad_norm_B_big - B_small*grad_norm_B_small)
-                    s = 1 / (1/B_small - 1/B_big) * (grad_norm_B_small - grad_norm_B_big)
+                    g2 = (
+                        1
+                        / (B_big - B_small)
+                        * (B_big * grad_norm_B_big - B_small * grad_norm_B_small)
+                    )
+                    s = (
+                        1
+                        / (1 / B_small - 1 / B_big)
+                        * (grad_norm_B_small - grad_norm_B_big)
+                    )
                     B_critical = s / g2
-                    self._cur_grad_norm_dict.update( self.grad_norm_dict )
-                self._cur_grad_norm_dict.update( {"critical_batch_size" : B_critical} )
-                for e in ['batch_size', 'grad_accum']:
+                    self._cur_grad_norm_dict.update(self.grad_norm_dict)
+                self._cur_grad_norm_dict.update({"critical_batch_size": B_critical})
+                for e in ["batch_size", "grad_accum"]:
                     self._cur_grad_norm_dict.pop(e)
                 # print(self._cur_grad_norm_dict)
             self.grad_norm_dict = None
         else:
             # print("track gradient with should_accumulate True")
             # first gradient accumulation step !!!!!!!!!!!!
-            if hasattr(self, 'grad_norm_dict') and self.grad_norm_dict is None:
+            if hasattr(self, "grad_norm_dict") and self.grad_norm_dict is None:
                 model = self.trainer.lightning_module
-                self.grad_norm_dict = self.grad_norm(model, self.trainer.track_grad_norm, True)
+                self.grad_norm_dict = self.grad_norm(
+                    model, self.trainer.track_grad_norm, True
+                )
 
     def run_training_epoch(self):
         # modify dataloader if needed (ddp, etc...)
-        train_dataloader = self.trainer.accelerator.process_dataloader(self.trainer.train_dataloader)
+        train_dataloader = self.trainer.accelerator.process_dataloader(
+            self.trainer.train_dataloader
+        )
 
         # track epoch output
         epoch_output = [[] for _ in range(self.num_optimizers)]
 
-        train_dataloader = self.trainer.data_connector.get_profiled_train_dataloader(train_dataloader)
+        train_dataloader = self.trainer.data_connector.get_profiled_train_dataloader(
+            train_dataloader
+        )
         dataloader_idx = 0
 
         batch_idx = None
@@ -868,12 +618,16 @@ class MyTrainLoop(TrainLoop):
             if self.args.warmup_bsz != 0:
                 # for key in batch.keys():
                 #     print(key, batch[key].shape, batch[key].device, batch[key].numel(), self.trainer.accumulate_grad_batches, self.trainer.model.device)
-                input_ids = batch['input_ids']
+                input_ids = batch["input_ids"]
 
-                final_bsz = input_ids.shape[0] * self.args.grad_accum * self.trainer.world_size
+                final_bsz = (
+                    input_ids.shape[0] * self.args.grad_accum * self.trainer.world_size
+                )
                 start_bsz = 64
 
-                current_bsz = start_bsz + (final_bsz - start_bsz) * min( 1.0,  accum_bsz / self.args.warmup_bsz )
+                current_bsz = start_bsz + (final_bsz - start_bsz) * min(
+                    1.0, accum_bsz / self.args.warmup_bsz
+                )
                 # print("before current_bsz", current_bsz, accum_bsz)
                 if current_bsz >= final_bsz:
                     self.trainer.accumulate_grad_batches = self.args.grad_accum
@@ -881,12 +635,14 @@ class MyTrainLoop(TrainLoop):
                     current_bsz = current_bsz // self.trainer.world_size
                     # try to reset gradient accum steps
                     grad_accum = int(max(1, current_bsz // input_ids.shape[0]))
-                
+
                     if grad_accum == 1 or accum_bsz_grad_step <= 0:
                         if grad_accum != 1 and accum_bsz_grad_step == 0:
-                           accum_bsz_grad_step = grad_accum
+                            accum_bsz_grad_step = grad_accum
                         self.trainer.accumulate_grad_batches = grad_accum
-                        bsz_after_chunk = int(current_bsz // self.trainer.accumulate_grad_batches)
+                        bsz_after_chunk = int(
+                            current_bsz // self.trainer.accumulate_grad_batches
+                        )
                     else:
                         accum_bsz_grad_step -= 1
 
@@ -894,18 +650,24 @@ class MyTrainLoop(TrainLoop):
                     # print("current_bsz", current_bsz, "grad_accum", grad_accum, self.trainer.accumulate_grad_batches, accum_bsz_grad_step, self.should_accumulate(), 'bsz_after_chunk', bsz_after_chunk, input_ids.shape[0])
                     if bsz_after_chunk < input_ids.shape[0]:
                         for key in batch.keys():
-                            batch[key] = torch.narrow(batch[key], 0, 0, bsz_after_chunk)#.to( self.trainer.model.device )
-                           
-                accum_bsz += batch['input_ids'].numel()
+                            batch[key] = torch.narrow(
+                                batch[key], 0, 0, bsz_after_chunk
+                            )  # .to( self.trainer.model.device )
+
+                accum_bsz += batch["input_ids"].numel()
 
             if self.args.warmup_seq != 0:
-                
-                input_ids = batch['input_ids']
+
+                input_ids = batch["input_ids"]
 
                 start_seq = 64
                 final_seq = input_ids.shape[1]
 
-                current_seq = int(start_seq + (final_seq - start_seq) * min( 1.0,  accum_bsz / self.args.warmup_seq ))
+                current_seq = int(
+                    start_seq
+                    + (final_seq - start_seq)
+                    * min(1.0, accum_bsz / self.args.warmup_seq)
+                )
                 if accum_bsz_grad_step <= 0:
                     accum_bsz_grad_step = self.trainer.accumulate_grad_batches
                 else:
@@ -915,8 +677,8 @@ class MyTrainLoop(TrainLoop):
                     for key in batch.keys():
                         batch[key] = torch.narrow(batch[key], 1, 0, current_seq)
 
-                accum_bsz += batch['input_ids'].numel()
-            
+                accum_bsz += batch["input_ids"].numel()
+
             # ------------------------------------
             # TRAINING_STEP + TRAINING_STEP_END
             # ------------------------------------
@@ -957,7 +719,9 @@ class MyTrainLoop(TrainLoop):
             self.save_loggers_on_train_batch_end()
 
             # update LR schedulers
-            monitor_metrics = copy.deepcopy(self.trainer.logger_connector.callback_metrics)
+            monitor_metrics = copy.deepcopy(
+                self.trainer.logger_connector.callback_metrics
+            )
             self.update_train_loop_lr_schedulers(monitor_metrics=monitor_metrics)
             self.trainer.checkpoint_connector.has_trained = True
 
@@ -965,7 +729,8 @@ class MyTrainLoop(TrainLoop):
 
             # max steps reached, end training
             if (
-                self.trainer.max_steps is not None and self.trainer.max_steps <= self.trainer.global_step + 1
+                self.trainer.max_steps is not None
+                and self.trainer.max_steps <= self.trainer.global_step + 1
                 and self._accumulated_batches_reached()
             ):
                 break
@@ -993,13 +758,17 @@ class MyTrainLoop(TrainLoop):
         # log epoch metrics
         self.trainer.logger_connector.log_train_epoch_end_metrics(epoch_output)
 
-        should_check_val = self._should_check_val_fx(batch_idx, is_last_batch, on_epoch=True)
-        should_skip_eval = self.trainer.evaluation_loop.should_skip_evaluation(self.trainer.num_val_batches)
+        should_check_val = self._should_check_val_fx(
+            batch_idx, is_last_batch, on_epoch=True
+        )
+        should_skip_eval = self.trainer.evaluation_loop.should_skip_evaluation(
+            self.trainer.num_val_batches
+        )
         should_train_only = self.trainer.disable_validation or should_skip_eval
 
         # update epoch level lr_schedulers if no val loop outside train loop is triggered
         if not should_check_val or should_train_only:
-            self.trainer.optimizer_connector.update_learning_rates(interval='epoch')
+            self.trainer.optimizer_connector.update_learning_rates(interval="epoch")
 
         if should_train_only:
             self.check_checkpoint_callback(True)
@@ -1012,16 +781,16 @@ class MyTrainLoop(TrainLoop):
         if batch_output.signal != -1:
             self.increment_accumulated_grad_global_step()
 
-class Pretrainer(ptl.LightningModule):
 
+class Pretrainer(ptl.LightningModule):
     def __init__(self):
         super().__init__()
 
         self.args = args  # hparams
-        self._set_hparams(self.args) #v1.3.5 ptl issue
+        self._set_hparams(self.args)  # v1.3.5 ptl issue
         # self.hparams = self.args
 
-        #self.model = AutoModelForMaskedLM.from_pretrained(args.model)
+        # self.model = AutoModelForMaskedLM.from_pretrained(args.model)
         self.model = AutoModelForCausalLM.from_pretrained(args.model)
         if args.random:
             if args.layers is not None and args.size is not None:
@@ -1029,37 +798,37 @@ class Pretrainer(ptl.LightningModule):
             if args.layers is not None:
                 self.model.config.n_layer = args.layers
             if args.size is not None:
-                if args.size == 'GPT2_base':
+                if args.size == "GPT2_base":
                     self.model.config.n_layer = 12
                     self.model.config.n_embd = 768
                     self.model.config.n_head = 8
-                elif args.size == 'GPT2_large':
+                elif args.size == "GPT2_large":
                     self.model.config.n_layer = 24
                     self.model.config.n_embd = 1536
                     self.model.config.n_head = 16
-                elif args.size == 'GPT2_base_div2_width':
+                elif args.size == "GPT2_base_div2_width":
                     self.model.config.n_layer = 12
                     self.model.config.n_embd = 384
                     self.model.config.n_head = 4
-                elif args.size == 'GPT2_base_div2_depth':
+                elif args.size == "GPT2_base_div2_depth":
                     self.model.config.n_layer = 6
                     self.model.config.n_embd = 768
                     self.model.config.n_head = 8
-                
-                elif args.size == 'GPT2_large_div4_width':
+
+                elif args.size == "GPT2_large_div4_width":
                     self.model.config.n_layer = 24
                     self.model.config.n_embd = 384
                     self.model.config.n_head = 4
-                
-                elif args.size == 'GPT2_large_div2_width':
+
+                elif args.size == "GPT2_large_div2_width":
                     self.model.config.n_layer = 24
                     self.model.config.n_embd = 768
                     self.model.config.n_head = 8
-                elif args.size == 'GPT2_large_div4_depth':
+                elif args.size == "GPT2_large_div4_depth":
                     self.model.config.n_layer = 6
                     self.model.config.n_embd = 1536
                     self.model.config.n_head = 16
-                elif args.size == 'GPT2_large_div2_depth':
+                elif args.size == "GPT2_large_div2_depth":
                     self.model.config.n_layer = 12
                     self.model.config.n_embd = 1536
                     self.model.config.n_head = 16
@@ -1067,7 +836,7 @@ class Pretrainer(ptl.LightningModule):
                     assert False
 
             assert self.model.config.n_positions == 1024
-            self.model.config.n_positions = args.seqlen            
+            self.model.config.n_positions = args.seqlen
             self.model = GPT2LMHeadModel(config=self.model.config)
         else:
             assert args.layers is None
@@ -1078,7 +847,9 @@ class Pretrainer(ptl.LightningModule):
         self.eos_token_id = tokenizer.eos_token_id or tokenizer.sep_token_id
         self.bos_token_id = tokenizer.bos_token_id or tokenizer.cls_token_id
 
-        logger.info(f'Creating dataset cache from dir {self.args.input_dir}. This could be slow the first time.')
+        logger.info(
+            f"Creating dataset cache from dir {self.args.input_dir}. This could be slow the first time."
+        )
         MMapTextDataset.raw_text_to_mmap(args)
 
         # TODO: add support for other objective functions (whole word masking, BART, Pegasus)
@@ -1094,10 +865,10 @@ class Pretrainer(ptl.LightningModule):
         param_count_before_to = len(list(self.parameters()))
         super().to(*args, **kwargs)
         if self.trainer.on_tpu:
-        # if self.trainer.use_tpu:
+            # if self.trainer.use_tpu:
             # need to re-tie the weights after moving to XLA!
             self.model.tie_weights()
-            if 'roberta' in self.args.model or 'longformer' in self.args.model:
+            if "roberta" in self.args.model or "longformer" in self.args.model:
                 self.model.lm_head.bias = self.model.lm_head.decoder.bias
         param_count_after_to = len(list(self.parameters()))
         assert param_count_before_to == param_count_after_to
@@ -1116,31 +887,35 @@ class Pretrainer(ptl.LightningModule):
 
     def training_step(self, batch, batch_nb):
         loss = self(batch)
-        input_ids = batch['input_ids']
+        input_ids = batch["input_ids"]
         tensorboard_logs = {
-            'input_size': input_ids.numel(),
-            'token_per_step': input_ids.numel() * self.trainer.accumulate_grad_batches * self.trainer.world_size,
+            "input_size": input_ids.numel(),
+            "token_per_step": input_ids.numel()
+            * self.trainer.accumulate_grad_batches
+            * self.trainer.world_size,
         }
         # if not self.use_tpu:
         if not self.trainer.on_tpu:
             # logging additional losses is slow on tpu
-            tensorboard_logs['lm_loss'] = loss
-            tensorboard_logs['lm_bpc'] = loss/math.log(2)
-            tensorboard_logs['lm_perplexity'] = torch.exp(loss)
+            tensorboard_logs["lm_loss"] = loss
+            tensorboard_logs["lm_bpc"] = loss / math.log(2)
+            tensorboard_logs["lm_perplexity"] = torch.exp(loss)
 
         if self.start_time != 0:
             # torch.cuda.synchronize()
             elapsed_time = time.monotonic() - self.start_time
-            tensorboard_logs['second_per_batch'] = elapsed_time
+            tensorboard_logs["second_per_batch"] = elapsed_time
         self.start_time = time.monotonic()
 
         if self.on_gpu:
-            tensorboard_logs['memory'] = torch.cuda.memory_allocated(loss.device) / 1024 ** 3
+            tensorboard_logs["memory"] = (
+                torch.cuda.memory_allocated(loss.device) / 1024 ** 3
+            )
 
         for k, v in tensorboard_logs.items():
             self.log(k, v)
 
-        return {'loss': loss}
+        return {"loss": loss}
 
     def on_train_batch_start(self, *args, **kwargs):
         self._start = time.monotonic()
@@ -1152,15 +927,17 @@ class Pretrainer(ptl.LightningModule):
     def validation_step(self, batch, batch_nb):
         # TODO: log how long evaluation takes
         self.start_time = 0  # reset training_step timer
-        
+
         loss = self(batch)
         tensorboard_logs = {
-            'val_lm_loss': loss.detach(),
+            "val_lm_loss": loss.detach(),
         }
-        return {'val_loss': tensorboard_logs["val_lm_loss"], 'log': tensorboard_logs}
+        return {"val_loss": tensorboard_logs["val_lm_loss"], "log": tensorboard_logs}
 
     def validation_epoch_end(self, outputs):
-        avg_loss = torch.stack([x['log']['val_lm_loss'] for x in outputs if 'val_lm_loss' in x['log']]).mean()
+        avg_loss = torch.stack(
+            [x["log"]["val_lm_loss"] for x in outputs if "val_lm_loss" in x["log"]]
+        ).mean()
         if self.trainer.accelerator_connector.use_ddp:
             # TODO: PTL is already doing this. Is it still needed here?
             # https://github.com/PyTorchLightning/pytorch-lightning/blob/0.8.5/pytorch_lightning/metrics/converters.py#L251
@@ -1169,7 +946,14 @@ class Pretrainer(ptl.LightningModule):
         elif self.on_tpu:
             avg_loss = xm.all_reduce(xm.REDUCE_SUM, avg_loss) / xm.xrt_world_size()
 
-        self.log('val_loss', avg_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log(
+            "val_loss",
+            avg_loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+        )
 
     def configure_optimizers(self):
         # no_decay = ["bias", "LayerNorm.weight"]
@@ -1186,28 +970,43 @@ class Pretrainer(ptl.LightningModule):
         # ]
         # optimizer_grouped_parameters
 
-        optimizer = AdamW(self.parameters(), lr=self.args.lr, eps=self.args.adam_epsilon,
-                          betas=(self.args.adam_beta1, self.args.adam_beta2),
-                          correct_bias=False)
+        optimizer = AdamW(
+            self.parameters(),
+            lr=self.args.lr,
+            eps=self.args.adam_epsilon,
+            betas=(self.args.adam_beta1, self.args.adam_beta2),
+            correct_bias=False,
+        )
         if self.args.restart_warmup_steps != 0 and self.args.restart_steps != 0:
             scheduler = get_restart_linear_schedule_with_warmup(
-            optimizer, num_warmup_steps=self.args.warmup_steps, num_training_steps=self.args.train_steps, 
-            restart_steps=self.args.restart_steps, restart_warmup_steps=self.args.restart_warmup_steps,
-        )
+                optimizer,
+                num_warmup_steps=self.args.warmup_steps,
+                num_training_steps=self.args.train_steps,
+                restart_steps=self.args.restart_steps,
+                restart_warmup_steps=self.args.restart_warmup_steps,
+            )
         else:
             scheduler = get_linear_schedule_with_warmup(
-            optimizer, num_warmup_steps=self.args.warmup_steps, num_training_steps=self.args.train_steps
-        )
+                optimizer,
+                num_warmup_steps=self.args.warmup_steps,
+                num_training_steps=self.args.train_steps,
+            )
         return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
 
     def _get_loader(self, fname, is_train):
-        dataset = MMapTextDataset(fname, chunk_size=self.args.seqlen,
-                                  bos_token_id=self.bos_token_id, eos_token_id=self.eos_token_id)
+        dataset = MMapTextDataset(
+            fname,
+            chunk_size=self.args.seqlen,
+            bos_token_id=self.bos_token_id,
+            eos_token_id=self.eos_token_id,
+        )
 
         # TODO: consider `replace_sampler_ddp=True` and removing the following if statement
         # if self.trainer.use_ddp:
         if self.trainer.accelerator_connector.use_ddp:
-            sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=is_train)
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset, shuffle=is_train
+            )
             shuffle = False
         elif self.trainer.on_tpu:
             sampler = torch.utils.data.distributed.DistributedSampler(
@@ -1222,21 +1021,21 @@ class Pretrainer(ptl.LightningModule):
             shuffle = is_train
 
         loader = DataLoader(
-                dataset,
-                batch_size=self.args.batch_size,
-                shuffle=shuffle,
-                sampler=sampler,
-                num_workers=self.args.num_workers,
-                collate_fn=self.data_collator,
-                drop_last=is_train,
+            dataset,
+            batch_size=self.args.batch_size,
+            shuffle=shuffle,
+            sampler=sampler,
+            num_workers=self.args.num_workers,
+            collate_fn=self.data_collator,
+            drop_last=is_train,
         )
         return loader
 
     def train_dataloader(self):
-        return self._get_loader(f'{self.args.input_dir}/cache/train.bin', True)
+        return self._get_loader(f"{self.args.input_dir}/cache/train.bin", True)
 
     def val_dataloader(self):
-        return self._get_loader(f'{self.args.input_dir}/cache/val.bin', False)
+        return self._get_loader(f"{self.args.input_dir}/cache/val.bin", False)
 
     def grad_norm(self, norm_type):
         # Override PTL `grad_norm` function to only return `total_grad_norm` instead norms of individual params
@@ -1248,18 +1047,27 @@ class Pretrainer(ptl.LightningModule):
         for p in parameters:
             param_norm = p.grad.norm(norm_type)
             total_norm.add_(param_norm)
-        return {'total_grad_norm': total_norm}
+        return {"total_grad_norm": total_norm}
 
     @staticmethod
     def add_args(parser):
         parser.add_argument("--seed", type=int, default=3)
 
         # Dataset. Some of these params are only useful when generating the dataset cache
-        parser.add_argument("--input_dir", type=str, default='/net/nfs2.allennlp/shengs/c4/')
-        parser.add_argument("--output_dir", type=str, default='/net/nfs2.allennlp/shengs/c4/')
-        
-        parser.add_argument("--data_type", type=str, default='tfrecord')
-        parser.add_argument("--add_sep_after_doc", action='store_true', default=False, help='add sep token after document')
+        parser.add_argument(
+            "--input_dir", type=str, default="/net/nfs2.allennlp/shengs/c4/"
+        )
+        parser.add_argument(
+            "--output_dir", type=str, default="/net/nfs2.allennlp/shengs/c4/"
+        )
+
+        parser.add_argument("--data_type", type=str, default="tfrecord")
+        parser.add_argument(
+            "--add_sep_after_doc",
+            action="store_true",
+            default=False,
+            help="add sep token after document",
+        )
 
         # Used only at the preprocessing phase
         parser.add_argument("--train_dev_split", type=float, default=0.05)
@@ -1269,56 +1077,103 @@ class Pretrainer(ptl.LightningModule):
         parser.add_argument("--seqlen", type=int, default=512)
 
         # HF model loading
-        parser.add_argument("--tokenizer", type=str, default='gpt2')
-        parser.add_argument("--model", type=str, default='gpt2')
-        parser.add_argument("--doubling", type=str) # could be layers / weights
-        parser.add_argument("--doubling_layers", type=str) # could be alternate_id, append_id,  alternate_copy, append_copy
+        parser.add_argument("--tokenizer", type=str, default="gpt2")
+        parser.add_argument("--model", type=str, default="gpt2")
+        parser.add_argument("--doubling", type=str)  # could be layers / weights
+        parser.add_argument(
+            "--doubling_layers", type=str
+        )  # could be alternate_id, append_id,  alternate_copy, append_copy
         # parser.add_argument("--noise_std", type=float, default=0.0)
-        parser.add_argument("--warmup_bsz", type=int, default=0, help='# warmup batch size')
-        parser.add_argument("--warmup_seq", type=int, default=0, help='# warmup sequence length')
+        parser.add_argument(
+            "--warmup_bsz", type=int, default=0, help="# warmup batch size"
+        )
+        parser.add_argument(
+            "--warmup_seq", type=int, default=0, help="# warmup sequence length"
+        )
 
-        parser.add_argument("--random", default=False, action='store_true')
+        parser.add_argument("--random", default=False, action="store_true")
         parser.add_argument("--layers", type=int)
         parser.add_argument("--size", type=str)
 
         # Checkpointing and logging
-        parser.add_argument("--save_dir", type=str, default='runs/')
-        parser.add_argument("--save_prefix", type=str, default='test',
-                            help="path of output directory is --save_dir/--save_prefix")
-        parser.add_argument("--resume", type=str, default=None,  # It is better to use a different output dir.
-                            help="Path to a checkpoint to load model weights and training state. It overwrites args")
-        parser.add_argument("--resume_model_only", type=str, default=None,
-                            help="Path to a checkpoint to load model weights but not training state")
-        parser.add_argument("--reset_optimizer", default=False, action='store_true')
-        parser.add_argument("--reset_lr_scheduler", default=False, action='store_true')
+        parser.add_argument("--save_dir", type=str, default="runs/")
+        parser.add_argument(
+            "--save_prefix",
+            type=str,
+            default="test",
+            help="path of output directory is --save_dir/--save_prefix",
+        )
+        parser.add_argument(
+            "--resume",
+            type=str,
+            default=None,  # It is better to use a different output dir.
+            help="Path to a checkpoint to load model weights and training state. It overwrites args",
+        )
+        parser.add_argument(
+            "--resume_model_only",
+            type=str,
+            default=None,
+            help="Path to a checkpoint to load model weights but not training state",
+        )
+        parser.add_argument("--reset_optimizer", default=False, action="store_true")
+        parser.add_argument("--reset_lr_scheduler", default=False, action="store_true")
         parser.add_argument("--log_rate", type=int, default=10)
-        parser.add_argument("--disable_checkpointing", action='store_true', default=False)
+        parser.add_argument(
+            "--disable_checkpointing", action="store_true", default=False
+        )
 
         # Training hyperparams
         parser.add_argument("--lr", type=float, default=1e-5)
-        parser.add_argument("--train_steps", type=int, default=3000, help='# training grad. updates')
-        parser.add_argument("--warmup_steps", type=int, default=1000, help='# warmup grad. updates')
-        parser.add_argument("--val_every", type=int, default=100, help='# training grad. updates between evaluations')
-        parser.add_argument("--val_batches", type=int, default=1000, help='# evaluation **batches**')
+        parser.add_argument(
+            "--train_steps", type=int, default=3000, help="# training grad. updates"
+        )
+        parser.add_argument(
+            "--warmup_steps", type=int, default=1000, help="# warmup grad. updates"
+        )
+        parser.add_argument(
+            "--val_every",
+            type=int,
+            default=100,
+            help="# training grad. updates between evaluations",
+        )
+        parser.add_argument(
+            "--val_batches", type=int, default=1000, help="# evaluation **batches**"
+        )
         parser.add_argument("--weight_decay", type=float, default=0.01)
         parser.add_argument("--adam_epsilon", type=float, default=1e-6)
         parser.add_argument("--adam_beta1", type=float, default=0.9)
         parser.add_argument("--adam_beta2", type=float, default=0.98)
-        parser.add_argument("--grad_clip", type=float, default=0)  # TODO: test this with fp16. Likely not working
+        parser.add_argument(
+            "--grad_clip", type=float, default=0
+        )  # TODO: test this with fp16. Likely not working
 
         # RoBERTa's tokens_per_step = 2^18 = 512(seqlen) x 1(gpu_count) x 32(batch_size) x 16(grad_accum)
         parser.add_argument("--batch_size", type=int, default=32)
         parser.add_argument("--grad_accum", type=int, default=1)
 
         # Compute resources
-        parser.add_argument("--fp16", default=False, action='store_true')
+        parser.add_argument("--fp16", default=False, action="store_true")
         parser.add_argument("--num_workers", type=int, default=0)
-        parser.add_argument("--gpu_count", type=int, default=1,  # `--gpus` is reserved for internal use by PTL
-                            help="Number of gpus. This respects `CUDA_VISIBLE_DEVICES`")
+        parser.add_argument(
+            "--gpu_count",
+            type=int,
+            default=1,  # `--gpus` is reserved for internal use by PTL
+            help="Number of gpus. This respects `CUDA_VISIBLE_DEVICES`",
+        )
 
-        # For restarting with warmup 
-        parser.add_argument("--restart_warmup_steps", type=int, default=0, help='# warmup grad. updates after restart')
-        parser.add_argument("--restart_steps", type=int, default=0, help='# restart steps, should be the same as set_global_steps')
+        # For restarting with warmup
+        parser.add_argument(
+            "--restart_warmup_steps",
+            type=int,
+            default=0,
+            help="# warmup grad. updates after restart",
+        )
+        parser.add_argument(
+            "--restart_steps",
+            type=int,
+            default=0,
+            help="# restart steps, should be the same as set_global_steps",
+        )
         # For multi-node training, use the PyTorch launch script. The script and instructions can be found here:
         # https://github.com/pytorch/pytorch/blob/master/torch/distributed/launch.py.
         # To run PTL in a mode compatible with the launch script, two things are needed:
@@ -1331,8 +1186,12 @@ class Pretrainer(ptl.LightningModule):
         #               scripts/pretrain.py  \
         #               --gpu_count 2  --node_count 2  \
         #               --input_dir my_data_dir  --save_prefix test_multinode
-        parser.add_argument("--node_count", type=int, default=1,
-                            help="Number of nodes. It needs to match --nnodes of torch.distributed.launch")
+        parser.add_argument(
+            "--node_count",
+            type=int,
+            default=1,
+            help="Number of nodes. It needs to match --nnodes of torch.distributed.launch",
+        )
         parser.add_argument("--tpu_core_count", type=int, default=None)
 
         return parser
@@ -1352,110 +1211,185 @@ def main(args):
 
     if args.doubling is not None:
 
-        doubled_resume = args.resume + '.doubled_weights' if args.doubling == 'weights' else args.resume + '.doubled_layer'
+        doubled_resume = (
+            args.resume + ".doubled_weights"
+            if args.doubling == "weights"
+            else args.resume + ".doubled_layer"
+        )
         print(doubled_resume)
         exsit_flag = os.path.isfile(doubled_resume)
 
         if exsit_flag:
             args.resume = doubled_resume
-            print('================== warning: reusing old ckpt =======================')
-
+            print(
+                "================== warning: reusing old ckpt ======================="
+            )
 
         # doubling the checkpoint before doubling the in-memory model
         if args.resume is not None and not exsit_flag:
             ckpt = torch.load(args.resume)
 
             # doubling state dict of the saved model
-            if args.doubling == 'weights':
-                model_state_dict = ckpt['state_dict']
-                ckpt['state_dict'] = double_state_dict(model_state_dict, is_double_embedding=True)
+            if args.doubling == "weights":
+                model_state_dict = ckpt["state_dict"]
+                ckpt["state_dict"] = double_state_dict(
+                    model_state_dict, is_double_embedding=True
+                )
 
                 # doubling state dict of the saved optimizer
                 # no_decay = ["bias", "LayerNorm.weight"]
                 # optimizer_params_by_name = [(n, p.shape) for n, p in pretrainer.named_parameters() if not any(nd in n for nd in no_decay) and p.requires_grad]
                 # optimizer_params_by_name.extend([(n, p.shape) for n, p in pretrainer.named_parameters() if any(nd in n for nd in no_decay) and p.requires_grad])
-                optimizer_params_by_name = [(n, p.shape) for n, p in pretrainer.named_parameters()]
-                assert len(optimizer_params_by_name) == len(ckpt['optimizer_states'][0]['state'])
-                for (param_name, param_shape), param in zip(optimizer_params_by_name, ckpt['optimizer_states'][0]['state'].values()):
-                    assert param['exp_avg'].shape == param_shape
-                    assert param['exp_avg_sq'].shape == param_shape
-                    param['exp_avg'] = double_param(param_name, param['exp_avg'], is_double_embedding=True, is_grad=True, is_avg_sq=False)
-                    param['exp_avg_sq'] = double_param(param_name, param['exp_avg_sq'], is_double_embedding=True, is_grad=True, is_avg_sq=True)
+                optimizer_params_by_name = [
+                    (n, p.shape) for n, p in pretrainer.named_parameters()
+                ]
+                assert len(optimizer_params_by_name) == len(
+                    ckpt["optimizer_states"][0]["state"]
+                )
+                for (param_name, param_shape), param in zip(
+                    optimizer_params_by_name,
+                    ckpt["optimizer_states"][0]["state"].values(),
+                ):
+                    assert param["exp_avg"].shape == param_shape
+                    assert param["exp_avg_sq"].shape == param_shape
+                    param["exp_avg"] = double_param(
+                        param_name,
+                        param["exp_avg"],
+                        is_double_embedding=True,
+                        is_grad=True,
+                        is_avg_sq=False,
+                    )
+                    param["exp_avg_sq"] = double_param(
+                        param_name,
+                        param["exp_avg_sq"],
+                        is_double_embedding=True,
+                        is_grad=True,
+                        is_avg_sq=True,
+                    )
 
                     # print(name_shape[0])
-                args.resume += '.doubled_weights'
-            elif args.doubling == 'layers':
-                model_state_dict = ckpt['state_dict']
+                args.resume += ".doubled_weights"
+            elif args.doubling == "layers":
+                model_state_dict = ckpt["state_dict"]
                 # hack for doubling the layers
-                prefix = 'model.transformer.h'
+                prefix = "model.transformer.h"
                 map_positions, copy_positions = {}, {}
                 for key in model_state_dict:
                     if prefix in key:
                         layer_idx = re.findall("[-\d]+", key)[0]
                         origin_idx = prefix + "." + str(int(layer_idx))
-                        if 'alternate' in args.doubling_layers:
+                        if "alternate" in args.doubling_layers:
                             insert_idx = prefix + "." + str(int(layer_idx) * 2 + 1)
-                            origin_key = key.replace(origin_idx, prefix + "." + str(int(layer_idx) * 2))
-                        elif 'append' in args.doubling_layers:
-                            insert_idx = prefix + "." + str(pretrainer.model.config.n_layer + int( layer_idx ))
+                            origin_key = key.replace(
+                                origin_idx, prefix + "." + str(int(layer_idx) * 2)
+                            )
+                        elif "append" in args.doubling_layers:
+                            insert_idx = (
+                                prefix
+                                + "."
+                                + str(pretrainer.model.config.n_layer + int(layer_idx))
+                            )
                             origin_key = key
 
-                        insert_key = key.replace( origin_idx, insert_idx )
-                        
-                        map_positions[ key ] = [ (origin_key, False), (insert_key, False) ]
-                        copy_positions[ insert_key ] = (key, False)
-                        copy_positions[ origin_key ] = (key, True)
+                        insert_key = key.replace(origin_idx, insert_idx)
 
-                is_identical = 'id' in args.doubling_layers
+                        map_positions[key] = [(origin_key, False), (insert_key, False)]
+                        copy_positions[insert_key] = (key, False)
+                        copy_positions[origin_key] = (key, True)
 
-                ckpt['state_dict'] =  deep_state_dict(model_state_dict, is_identical=is_identical, map_positions=map_positions)
+                is_identical = "id" in args.doubling_layers
+
+                ckpt["state_dict"] = deep_state_dict(
+                    model_state_dict,
+                    is_identical=is_identical,
+                    map_positions=map_positions,
+                )
 
                 # deal with the optimizer state
-                original_optimizer_params_by_name = [(n, p.shape) for n, p in pretrainer.named_parameters()]
+                original_optimizer_params_by_name = [
+                    (n, p.shape) for n, p in pretrainer.named_parameters()
+                ]
                 # print( "original_optimizer_params_by_name", original_optimizer_params_by_name )
                 # print( "ckpt optimizer_states", ckpt['optimizer_states'][0]['state'].keys() )
                 layers = pretrainer.model.transformer.h
                 n = len(layers)
                 for i in range(n):
-                    if 'alternate' in args.doubling_layers:
+                    if "alternate" in args.doubling_layers:
                         layers.insert(i * 2, copy.deepcopy(layers[i * 2]))
-                    elif 'append' in args.doubling_layers:
-                        layers.append( copy.deepcopy(layers[i]) )
+                    elif "append" in args.doubling_layers:
+                        layers.append(copy.deepcopy(layers[i]))
 
                 pretrainer.model.config.n_layer *= 2
                 pretrainer.model.tie_weights()
-                new_optimizer_params_by_name = [(n, p.shape) for n, p in pretrainer.named_parameters()]
+                new_optimizer_params_by_name = [
+                    (n, p.shape) for n, p in pretrainer.named_parameters()
+                ]
 
-                new_optimizer_state = { _:{} for _ in range(len(new_optimizer_params_by_name)) }
-                assert len(original_optimizer_params_by_name) == len(ckpt['optimizer_states'][0]['state'])
+                new_optimizer_state = {
+                    _: {} for _ in range(len(new_optimizer_params_by_name))
+                }
+                assert len(original_optimizer_params_by_name) == len(
+                    ckpt["optimizer_states"][0]["state"]
+                )
                 original_optimizer_param_name_dict = {}
-                for (param_name, param_shape), param in zip(original_optimizer_params_by_name, ckpt['optimizer_states'][0]['state'].values()):
-                    assert param['exp_avg'].shape == param_shape
-                    assert param['exp_avg_sq'].shape == param_shape
-                    original_optimizer_param_name_dict[ param_name ] = copy.deepcopy(param)
+                for (param_name, param_shape), param in zip(
+                    original_optimizer_params_by_name,
+                    ckpt["optimizer_states"][0]["state"].values(),
+                ):
+                    assert param["exp_avg"].shape == param_shape
+                    assert param["exp_avg_sq"].shape == param_shape
+                    original_optimizer_param_name_dict[param_name] = copy.deepcopy(
+                        param
+                    )
 
-                for param_idx, (param_name, param_shape) in enumerate(new_optimizer_params_by_name):
+                for param_idx, (param_name, param_shape) in enumerate(
+                    new_optimizer_params_by_name
+                ):
                     if copy_positions.get(param_name):
-                        copy_param_name, copy_param_flag = copy_positions.get(param_name)
+                        copy_param_name, copy_param_flag = copy_positions.get(
+                            param_name
+                        )
                         param_is_identical = copy_param_flag and is_identical
-                        new_optimizer_state[ param_idx ] = copy.deepcopy(original_optimizer_param_name_dict[ copy_param_name ])
-                        new_optimizer_state[ param_idx ]['exp_avg'] = deep_param(param_name, original_optimizer_param_name_dict[ copy_param_name ]['exp_avg'], is_identical=param_is_identical, is_grad=True, is_avg_sq=False)
-                        new_optimizer_state[ param_idx ]['exp_avg_sq'] = deep_param(param_name, original_optimizer_param_name_dict[ copy_param_name ]['exp_avg_sq'], is_identical=param_is_identical, is_grad=True, is_avg_sq=True)
+                        new_optimizer_state[param_idx] = copy.deepcopy(
+                            original_optimizer_param_name_dict[copy_param_name]
+                        )
+                        new_optimizer_state[param_idx]["exp_avg"] = deep_param(
+                            param_name,
+                            original_optimizer_param_name_dict[copy_param_name][
+                                "exp_avg"
+                            ],
+                            is_identical=param_is_identical,
+                            is_grad=True,
+                            is_avg_sq=False,
+                        )
+                        new_optimizer_state[param_idx]["exp_avg_sq"] = deep_param(
+                            param_name,
+                            original_optimizer_param_name_dict[copy_param_name][
+                                "exp_avg_sq"
+                            ],
+                            is_identical=param_is_identical,
+                            is_grad=True,
+                            is_avg_sq=True,
+                        )
                     else:
-                        new_optimizer_state[ param_idx ] = copy.deepcopy(original_optimizer_param_name_dict[param_name])
+                        new_optimizer_state[param_idx] = copy.deepcopy(
+                            original_optimizer_param_name_dict[param_name]
+                        )
 
-                ckpt['optimizer_states'][0]['state'] = new_optimizer_state
-                ckpt['optimizer_states'][0]['param_groups'][0]['params'] = list(new_optimizer_state.keys())
+                ckpt["optimizer_states"][0]["state"] = new_optimizer_state
+                ckpt["optimizer_states"][0]["param_groups"][0]["params"] = list(
+                    new_optimizer_state.keys()
+                )
                 del original_optimizer_param_name_dict
-                args.resume += '.doubled_layer'
+                args.resume += ".doubled_layer"
 
             torch.save(ckpt, args.resume)
             exit()
 
         # we need to resume the model after the doubling
-        if args.doubling == 'layers':
+        if args.doubling == "layers":
             assert True
-        elif args.doubling == 'weights':
+        elif args.doubling == "weights":
             assert True
         else:
             assert False
@@ -1464,9 +1398,7 @@ def main(args):
     # it is used by the trainer, and certain return variables
     # from the model are automatically logged
     logger = TestTubeLogger(
-        save_dir=args.save_dir,
-        name=args.save_prefix,
-        version=0  # always use version=0
+        save_dir=args.save_dir, name=args.save_prefix, version=0  # always use version=0
     )
 
     checkpoint_callback = ModelCheckpoint(
@@ -1474,7 +1406,7 @@ def main(args):
         # filepath=os.path.join(args.save_dir, args.save_prefix, 'checkpoint'),
         # prefix='',
         dirpath=os.path.join(args.save_dir, args.save_prefix),
-        filename='checkpoint-{epoch}-{step}',
+        filename="checkpoint-{epoch}-{step}",
         save_top_k=-1,
         # save_top_k=10,
         every_n_train_steps=250,
@@ -1489,12 +1421,16 @@ def main(args):
         gpus=args.gpu_count,
         num_nodes=args.node_count,
         tpu_cores=args.tpu_core_count,
-        distributed_backend='ddp',  #  if (args.gpu_count > 1 or args.node_count > 1) else None,
+        distributed_backend="ddp",  #  if (args.gpu_count > 1 or args.node_count > 1) else None,
         replace_sampler_ddp=False,
-        track_grad_norm=2 if args.tpu_core_count is None else -1,  # gradnorm logging is slow on tpus
-        max_epochs=10000, min_epochs=0,
+        track_grad_norm=2
+        if args.tpu_core_count is None
+        else -1,  # gradnorm logging is slow on tpus
+        max_epochs=10000,
+        min_epochs=0,
         max_steps=args.train_steps,  # run for many epochs, but stop after max_steps
-        val_check_interval=args.val_every, limit_val_batches=args.val_batches,
+        val_check_interval=args.val_every,
+        limit_val_batches=args.val_batches,
         log_every_n_steps=args.log_rate,
         progress_bar_refresh_rate=args.log_rate,
         logger=logger,
@@ -1502,19 +1438,23 @@ def main(args):
         accumulate_grad_batches=args.grad_accum,
         resume_from_checkpoint=args.resume,
         gradient_clip_val=args.grad_clip,
-        precision=16 if args.fp16 else 32, amp_level='O2',
+        precision=16 if args.fp16 else 32,
+        amp_level="O2",
         num_sanity_val_steps=2,
         callbacks=[LearningRateMonitor(), checkpoint_callback],
         profiler="simple",
     )
     trainer.profiler.dirpath = os.path.join(args.save_dir, args.save_prefix)
-    trainer.profiler.filename = 'profiler'
-    trainer.train_loop = MyTrainLoop(trainer,
-        multiple_trainloader_mode='max_size_cycle', args=args)
-    trainer.checkpoint_connector = MyCheckpointConnector(trainer,
-                                                         reset_lr_scheduler=args.reset_lr_scheduler,
-                                                         reset_optimizer=args.reset_optimizer,
-                                                         set_global_step=args.restart_steps+1)
+    trainer.profiler.filename = "profiler"
+    trainer.train_loop = MyTrainLoop(
+        trainer, multiple_trainloader_mode="max_size_cycle", args=args
+    )
+    trainer.checkpoint_connector = MyCheckpointConnector(
+        trainer,
+        reset_lr_scheduler=args.reset_lr_scheduler,
+        reset_optimizer=args.reset_optimizer,
+        set_global_step=args.restart_steps + 1,
+    )
     trainer.fit(pretrainer)
 
 
